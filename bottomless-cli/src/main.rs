@@ -133,8 +133,23 @@ async fn detect_database(options: &Cli, namespace: &str) -> Result<(String, Stri
     let database = match options.database.clone() {
         Some(db) => db,
         None => {
+            let timeout_config = aws_smithy_types::timeout::TimeoutConfig::builder()
+                .connect_timeout(std::time::Duration::from_secs(
+                    std::env::var("LIBSQL_BOTTOMLESS_S3_CONNECT_TIMEOUT_SECS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(5),
+                ))
+                .read_timeout(std::time::Duration::from_secs(
+                    std::env::var("LIBSQL_BOTTOMLESS_S3_READ_TIMEOUT_SECS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(5),
+                ))
+                .build();
             let client = Client::from_conf({
-                let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+                let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .timeout_config(timeout_config);
                 if let Some(endpoint) = options.endpoint.clone() {
                     loader = loader.endpoint_url(endpoint);
                 }

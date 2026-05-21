@@ -121,6 +121,10 @@ pub struct Options {
     pub s3_max_parallelism: usize,
     /// Max number of retries for S3 operations
     pub s3_max_retries: u32,
+    /// Max seconds to wait for first byte of S3 response
+    pub s3_read_timeout_secs: u64,
+    /// Max seconds to wait for S3 connection establishment
+    pub s3_connect_timeout_secs: u64,
     /// Skip snapshot upload per checkpoint.
     pub skip_snapshot: bool,
     /// Skip uploading snapshots on shutdown
@@ -145,8 +149,15 @@ impl Options {
             "LIBSQL_BOTTOMLESS_AWS_SECRET_ACCESS_KEY was not set"
         ))?;
         let session_token: Option<String> = self.session_token.clone();
+
+        let timeout_config = aws_smithy_types::timeout::TimeoutConfig::builder()
+            .connect_timeout(Duration::from_secs(self.s3_connect_timeout_secs))
+            .read_timeout(Duration::from_secs(self.s3_read_timeout_secs))
+            .build();
+
         let conf = loader
             .behavior_version(BehaviorVersion::latest())
+            .timeout_config(timeout_config)
             .region(Region::new(region))
             .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
                 access_key_id,
@@ -233,6 +244,10 @@ impl Options {
             ),
         };
         let s3_max_retries = env_var_or("LIBSQL_BOTTOMLESS_S3_MAX_RETRIES", 10).parse::<u32>()?;
+        let s3_read_timeout_secs =
+            env_var_or("LIBSQL_BOTTOMLESS_S3_READ_TIMEOUT_SECS", 5).parse::<u64>()?;
+        let s3_connect_timeout_secs =
+            env_var_or("LIBSQL_BOTTOMLESS_S3_CONNECT_TIMEOUT_SECS", 5).parse::<u64>()?;
         let cipher = match encryption_cipher {
             Some(cipher) => Cipher::from_str(&cipher)?,
             None => Cipher::default(),
@@ -261,6 +276,8 @@ impl Options {
             region,
             bucket_name,
             s3_max_retries,
+            s3_read_timeout_secs,
+            s3_connect_timeout_secs,
             skip_snapshot,
             skip_shutdown_upload,
         })
@@ -2182,5 +2199,52 @@ impl std::fmt::Display for CompressionKind {
             CompressionKind::Gzip => write!(f, "gz"),
             CompressionKind::Zstd => write!(f, "zstd"),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn client_config_applies_timeouts() {
+        let options = Options {
+            create_bucket_if_not_exists: true,
+            verify_crc: false,
+            use_compression: CompressionKind::None,
+            encryption_config: None,
+            aws_endpoint: Some("http://localhost:9000".to_string()),
+            access_key_id: Some("test".to_string()),
+            secret_access_key: Some("test".to_string()),
+            session_token: None,
+            region: Some("us-east-1".to_string()),
+            db_id: None,
+            bucket_name: "test".to_string(),
+            max_frames_per_batch: 1000,
+            max_batch_interval: Duration::from_secs(1),
+            s3_max_parallelism: 1,
+            s3_max_retries: 1,
+            s3_read_timeout_secs: 7,
+            s3_connect_timeout_secs: 3,
+            skip_snapshot: false,
+            skip_shutdown_upload: false,
+        };
+
+        let config = options.client_config().await.unwrap();
+        let timeout_config = config
+            .timeout_config()
+            .expect("timeout_config should be set");
+
+        assert_eq!(
+            timeout_config.connect_timeout(),
+            Some(Duration::from_secs(3)),
+            "connect_timeout should be 3s"
+        );
+        assert_eq!(
+            timeout_config.read_timeout(),
+            Some(Duration::from_secs(7)),
+            "read_timeout should be 7s"
+        );
     }
 }

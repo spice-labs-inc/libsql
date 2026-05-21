@@ -914,6 +914,7 @@ dependencies = [
  "async-compression 0.4.11",
  "aws-config",
  "aws-sdk-s3",
+ "aws-smithy-types",
  "bytes",
  "chrono",
  "futures-core",

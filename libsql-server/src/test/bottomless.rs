@@ -10,6 +10,9 @@ use s3s::service::S3ServiceBuilder;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Once;
+use std::time::Instant;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
 use tokio::time::sleep;
 use tokio::time::Duration;
 use url::Url;
@@ -576,4 +579,217 @@ impl Drop for S3BucketCleaner {
         //FIXME: running line below on tokio::test runtime will hang.
         //let _ = block_on(Self::cleanup(self.0));
     }
+}
+
+/// Start a TCP server that accepts connections but never sends a response.
+/// Used to test read_timeout behavior.
+async fn start_stall_server(port: u16) {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Accept connection, read the request, then hang — this causes read_timeout to fire
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            });
+        }
+    });
+    // Give the server a moment to start listening
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn s3_read_timeout_fires() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Start a stall server on a different port
+    start_stall_server(9001).await;
+
+    // Point the client at the stall server with very short timeouts
+    std::env::set_var("LIBSQL_BOTTOMLESS_ENDPOINT", "http://127.0.0.1:9001");
+    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_ACCESS_KEY_ID", "test");
+    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_SECRET_ACCESS_KEY", "test");
+    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_DEFAULT_REGION", "us-east-1");
+    std::env::set_var("LIBSQL_BOTTOMLESS_BUCKET", "test-bucket");
+    std::env::set_var("LIBSQL_BOTTOMLESS_S3_CONNECT_TIMEOUT_SECS", "1");
+    std::env::set_var("LIBSQL_BOTTOMLESS_S3_READ_TIMEOUT_SECS", "1");
+    std::env::set_var("LIBSQL_BOTTOMLESS_S3_MAX_RETRIES", "1");
+
+    let options = bottomless::replicator::Options::from_env().unwrap();
+    let client = Client::from_conf(options.client_config().await.unwrap());
+
+    let start = Instant::now();
+    let result = client.head_bucket().bucket("test-bucket").send().await;
+    let elapsed = start.elapsed();
+
+    // Should fail — note: AWS SDK internal retry/backoff may add significant time,
+    // so we just verify it does eventually timeout rather than hanging indefinitely
+    assert!(result.is_err(), "Expected timeout error, got {:?}", result);
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "Should have timed out, took {:?}",
+        elapsed
+    );
+}
+
+#[tokio::test]
+async fn s3_connect_timeout_fires() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Use a blackhole IP (TEST-NET-1) so the TCP handshake stalls and
+    // connect_timeout fires. A listening socket that never calls accept()
+    // would still complete the handshake at the kernel level, so it would
+    // not trigger connect_timeout.
+    std::env::set_var("LIBSQL_BOTTOMLESS_ENDPOINT", "http://192.0.2.1:12345");
+    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_ACCESS_KEY_ID", "test");
+    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_SECRET_ACCESS_KEY", "test");
+    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_DEFAULT_REGION", "us-east-1");
+    std::env::set_var("LIBSQL_BOTTOMLESS_BUCKET", "test-bucket");
+    std::env::set_var("LIBSQL_BOTTOMLESS_S3_CONNECT_TIMEOUT_SECS", "2");
+    std::env::set_var("LIBSQL_BOTTOMLESS_S3_READ_TIMEOUT_SECS", "60");
+    std::env::set_var("LIBSQL_BOTTOMLESS_S3_MAX_RETRIES", "1");
+
+    let options = bottomless::replicator::Options::from_env().unwrap();
+    let client = Client::from_conf(options.client_config().await.unwrap());
+
+    let start = Instant::now();
+    let result = client.head_bucket().bucket("test-bucket").send().await;
+    let elapsed = start.elapsed();
+
+    assert!(result.is_err(), "Expected timeout error, got {:?}", result);
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "Should have timed out, took {:?}",
+        elapsed
+    );
+}
+
+/// Test that the server fails to start (rather than hanging indefinitely) when
+/// bottomless restore starts but the S3 connection is interrupted (stalls).
+/// This simulates an S3 server that accepts the TCP connection but never
+/// sends a response, causing read_timeout to fire.
+#[tokio::test]
+async fn restore_fails_quickly_when_s3_interrupted() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    const DB_ID: &str = "testrestoretimeout";
+    const BUCKET: &str = "testrestoretimeout";
+    const PATH: &str = "restore_timeout.sqld";
+    const PORT: u16 = 15003;
+
+    // Step 1: Start the mock S3 server and create a database with bottomless replication.
+    // We set aws_endpoint explicitly so this test is immune to env vars left behind by
+    // other tests running in parallel.
+    start_s3_server().await;
+
+    // Build options without from_env() to avoid cross-test env var pollution.
+    let options = bottomless::replicator::Options {
+        db_id: Some(DB_ID.to_string()),
+        create_bucket_if_not_exists: true,
+        verify_crc: true,
+        use_compression: bottomless::replicator::CompressionKind::Gzip,
+        encryption_config: None,
+        aws_endpoint: Some("http://localhost:9000".to_string()),
+        access_key_id: Some("bar".to_string()),
+        secret_access_key: Some("foo".to_string()),
+        session_token: None,
+        region: Some("us-east-1".to_string()),
+        bucket_name: BUCKET.to_string(),
+        max_frames_per_batch: 10_000,
+        max_batch_interval: Duration::from_millis(250),
+        s3_max_parallelism: 32,
+        s3_max_retries: 10,
+        s3_read_timeout_secs: 5,
+        s3_connect_timeout_secs: 5,
+        skip_snapshot: false,
+        skip_shutdown_upload: false,
+    };
+    let connection_addr = Url::parse(&format!("http://localhost:{}", PORT)).unwrap();
+    let listener_addr = format!("0.0.0.0:{}", PORT)
+        .to_socket_addrs()
+        .unwrap()
+        .next()
+        .unwrap();
+
+    {
+        let cleaner = DbFileCleaner::new(PATH);
+        // Set env vars that the meta store will read during server.start()
+        std::env::set_var("LIBSQL_BOTTOMLESS_ENDPOINT", "http://localhost:9000");
+        std::env::set_var("LIBSQL_BOTTOMLESS_AWS_ACCESS_KEY_ID", "bar");
+        std::env::set_var("LIBSQL_BOTTOMLESS_AWS_SECRET_ACCESS_KEY", "foo");
+        std::env::set_var("LIBSQL_BOTTOMLESS_AWS_DEFAULT_REGION", "us-east-1");
+        let db_job = start_db(1, configure_server(&options, listener_addr, PATH).await);
+
+        sleep(Duration::from_secs(2)).await;
+
+        let _ = sql(
+            &connection_addr,
+            ["CREATE TABLE IF NOT EXISTS t(id INT PRIMARY KEY, name TEXT);"],
+        )
+        .await
+        .unwrap();
+
+        let _ = sql(&connection_addr, ["INSERT INTO t(id, name) VALUES(1, 'A')"])
+            .await
+            .unwrap();
+
+        sleep(Duration::from_secs(3)).await;
+        db_job.await;
+        drop(cleaner);
+    }
+
+    // Step 2: Delete local database file and replace the S3 endpoint with a
+    // stall server (accepts connections but never responds). This simulates an
+    // S3 connection that starts but is interrupted.
+    assert!(!std::path::Path::new(PATH).exists());
+
+    start_stall_server(9002).await;
+
+    let stall_options = bottomless::replicator::Options {
+        db_id: Some(DB_ID.to_string()),
+        create_bucket_if_not_exists: true,
+        verify_crc: true,
+        use_compression: bottomless::replicator::CompressionKind::Gzip,
+        encryption_config: None,
+        aws_endpoint: Some("http://127.0.0.1:9002".to_string()),
+        access_key_id: Some("bar".to_string()),
+        secret_access_key: Some("foo".to_string()),
+        session_token: None,
+        region: Some("us-east-1".to_string()),
+        bucket_name: BUCKET.to_string(),
+        max_frames_per_batch: 10_000,
+        max_batch_interval: Duration::from_millis(250),
+        s3_max_parallelism: 32,
+        s3_max_retries: 1,
+        s3_read_timeout_secs: 2,
+        s3_connect_timeout_secs: 2,
+        skip_snapshot: false,
+        skip_shutdown_upload: false,
+    };
+
+    let server = configure_server(&stall_options, listener_addr, PATH).await;
+    let start = Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(30), server.start()).await;
+    let elapsed = start.elapsed();
+
+    match result {
+        Ok(Ok(())) => panic!("Server should not have started successfully with stalled S3"),
+        Ok(Err(_)) => {
+            // Server returned an error (expected)
+        }
+        Err(_) => {
+            panic!("Server start hung for too long when S3 connection was interrupted");
+        }
+    }
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "Server start should have completed quickly, took {:?}",
+        elapsed
+    );
 }
