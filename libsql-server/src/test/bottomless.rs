@@ -29,12 +29,6 @@ const S3_URL: &str = "http://localhost:9000/";
 static S3_SERVER: Once = Once::new();
 
 async fn start_s3_server() {
-    std::env::set_var("LIBSQL_BOTTOMLESS_ENDPOINT", "http://localhost:9000");
-    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_SECRET_ACCESS_KEY", "foo");
-    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_ACCESS_KEY_ID", "bar");
-    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_DEFAULT_REGION", "us-east-1");
-    std::env::set_var("LIBSQL_BOTTOMLESS_BUCKET", "my-bucket");
-
     S3_SERVER.call_once(|| {
         let tmp = std::env::temp_dir().join(format!("s3s-{}", Uuid::new_v4().as_simple()));
 
@@ -44,19 +38,21 @@ async fn start_s3_server() {
 
         let s3_impl = s3s_fs::FileSystem::new(tmp).unwrap();
 
-        let key = std::env::var("LIBSQL_BOTTOMLESS_AWS_ACCESS_KEY_ID").unwrap();
-        let secret = std::env::var("LIBSQL_BOTTOMLESS_AWS_SECRET_ACCESS_KEY").unwrap();
-
-        let auth = SimpleAuth::from_single(key, secret);
+        let auth = SimpleAuth::from_single("bar", "foo");
 
         let mut s3 = S3ServiceBuilder::new(s3_impl);
         s3.set_auth(auth);
         let s3 = s3.build().into_shared().into_make_service();
 
-        tokio::spawn(async move {
-            let addr = ([127, 0, 0, 1], 9000).into();
-
-            hyper::Server::bind(&addr).serve(s3).await.unwrap();
+        // #[tokio::test] creates a fresh runtime per test and aborts all tasks
+        // when the test finishes. We must run the mock S3 server on a separate
+        // runtime so it survives past any individual test's lifetime.
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let addr = ([127, 0, 0, 1], 9000).into();
+                hyper::Server::bind(&addr).serve(s3).await.unwrap();
+            });
         });
     });
 
@@ -146,9 +142,21 @@ async fn backup_restore() {
         create_bucket_if_not_exists: true,
         verify_crc: true,
         use_compression: bottomless::replicator::CompressionKind::Gzip,
+        encryption_config: None,
+        aws_endpoint: Some("http://localhost:9000".to_string()),
+        access_key_id: Some("bar".to_string()),
+        secret_access_key: Some("foo".to_string()),
+        session_token: None,
+        region: Some("us-east-1".to_string()),
         bucket_name: BUCKET.to_string(),
+        max_frames_per_batch: 10000,
         max_batch_interval: Duration::from_millis(250),
-        ..bottomless::replicator::Options::from_env().unwrap()
+        s3_max_parallelism: 32,
+        s3_max_retries: 10,
+        s3_read_timeout_secs: 5,
+        s3_connect_timeout_secs: 5,
+        skip_snapshot: false,
+        skip_shutdown_upload: false,
     };
     let connection_addr = Url::parse(&format!("http://localhost:{}", PORT)).unwrap();
     let listener_addr = format!("0.0.0.0:{}", PORT)
@@ -296,9 +304,21 @@ async fn rollback_restore() {
         create_bucket_if_not_exists: true,
         verify_crc: true,
         use_compression: bottomless::replicator::CompressionKind::Gzip,
+        encryption_config: None,
+        aws_endpoint: Some("http://localhost:9000".to_string()),
+        access_key_id: Some("bar".to_string()),
+        secret_access_key: Some("foo".to_string()),
+        session_token: None,
+        region: Some("us-east-1".to_string()),
         bucket_name: BUCKET.to_string(),
+        max_frames_per_batch: 10000,
         max_batch_interval: Duration::from_millis(250),
-        ..bottomless::replicator::Options::from_env().unwrap()
+        s3_max_parallelism: 32,
+        s3_max_retries: 10,
+        s3_read_timeout_secs: 5,
+        s3_connect_timeout_secs: 5,
+        skip_snapshot: false,
+        skip_shutdown_upload: false,
     };
     let make_server = || async { configure_server(&options, listener_addr, PATH).await };
 
@@ -437,16 +457,8 @@ async fn s3_config() -> aws_sdk_s3::config::Config {
     let loader = aws_config::from_env().endpoint_url(S3_URL);
     aws_sdk_s3::config::Builder::from(&loader.load().await)
         .force_path_style(true)
-        .region(Region::new(
-            std::env::var("LIBSQL_BOTTOMLESS_AWS_DEFAULT_REGION").unwrap(),
-        ))
-        .credentials_provider(Credentials::new(
-            std::env::var("LIBSQL_BOTTOMLESS_AWS_ACCESS_KEY_ID").unwrap(),
-            std::env::var("LIBSQL_BOTTOMLESS_AWS_SECRET_ACCESS_KEY").unwrap(),
-            None,
-            None,
-            "Static",
-        ))
+        .region(Region::new("us-east-1".to_string()))
+        .credentials_provider(Credentials::new("bar", "foo", None, None, "Static"))
         .build()
 }
 
@@ -611,17 +623,27 @@ async fn s3_read_timeout_fires() {
     // Start a stall server on a different port
     start_stall_server(9001).await;
 
-    // Point the client at the stall server with very short timeouts
-    std::env::set_var("LIBSQL_BOTTOMLESS_ENDPOINT", "http://127.0.0.1:9001");
-    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_ACCESS_KEY_ID", "test");
-    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_SECRET_ACCESS_KEY", "test");
-    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_DEFAULT_REGION", "us-east-1");
-    std::env::set_var("LIBSQL_BOTTOMLESS_BUCKET", "test-bucket");
-    std::env::set_var("LIBSQL_BOTTOMLESS_S3_CONNECT_TIMEOUT_SECS", "1");
-    std::env::set_var("LIBSQL_BOTTOMLESS_S3_READ_TIMEOUT_SECS", "1");
-    std::env::set_var("LIBSQL_BOTTOMLESS_S3_MAX_RETRIES", "1");
-
-    let options = bottomless::replicator::Options::from_env().unwrap();
+    let options = bottomless::replicator::Options {
+        db_id: None,
+        create_bucket_if_not_exists: true,
+        verify_crc: true,
+        use_compression: bottomless::replicator::CompressionKind::Gzip,
+        encryption_config: None,
+        aws_endpoint: Some("http://127.0.0.1:9001".to_string()),
+        access_key_id: Some("test".to_string()),
+        secret_access_key: Some("test".to_string()),
+        session_token: None,
+        region: Some("us-east-1".to_string()),
+        bucket_name: "test-bucket".to_string(),
+        max_frames_per_batch: 10000,
+        max_batch_interval: Duration::from_millis(250),
+        s3_max_parallelism: 32,
+        s3_max_retries: 1,
+        s3_read_timeout_secs: 1,
+        s3_connect_timeout_secs: 1,
+        skip_snapshot: false,
+        skip_shutdown_upload: false,
+    };
     let client = Client::from_conf(options.client_config().await.unwrap());
 
     let start = Instant::now();
@@ -646,16 +668,27 @@ async fn s3_connect_timeout_fires() {
     // connect_timeout fires. A listening socket that never calls accept()
     // would still complete the handshake at the kernel level, so it would
     // not trigger connect_timeout.
-    std::env::set_var("LIBSQL_BOTTOMLESS_ENDPOINT", "http://192.0.2.1:12345");
-    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_ACCESS_KEY_ID", "test");
-    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_SECRET_ACCESS_KEY", "test");
-    std::env::set_var("LIBSQL_BOTTOMLESS_AWS_DEFAULT_REGION", "us-east-1");
-    std::env::set_var("LIBSQL_BOTTOMLESS_BUCKET", "test-bucket");
-    std::env::set_var("LIBSQL_BOTTOMLESS_S3_CONNECT_TIMEOUT_SECS", "2");
-    std::env::set_var("LIBSQL_BOTTOMLESS_S3_READ_TIMEOUT_SECS", "60");
-    std::env::set_var("LIBSQL_BOTTOMLESS_S3_MAX_RETRIES", "1");
-
-    let options = bottomless::replicator::Options::from_env().unwrap();
+    let options = bottomless::replicator::Options {
+        db_id: None,
+        create_bucket_if_not_exists: true,
+        verify_crc: true,
+        use_compression: bottomless::replicator::CompressionKind::Gzip,
+        encryption_config: None,
+        aws_endpoint: Some("http://192.0.2.1:12345".to_string()),
+        access_key_id: Some("test".to_string()),
+        secret_access_key: Some("test".to_string()),
+        session_token: None,
+        region: Some("us-east-1".to_string()),
+        bucket_name: "test-bucket".to_string(),
+        max_frames_per_batch: 10000,
+        max_batch_interval: Duration::from_millis(250),
+        s3_max_parallelism: 32,
+        s3_max_retries: 1,
+        s3_read_timeout_secs: 60,
+        s3_connect_timeout_secs: 2,
+        skip_snapshot: false,
+        skip_shutdown_upload: false,
+    };
     let client = Client::from_conf(options.client_config().await.unwrap());
 
     let start = Instant::now();
@@ -719,11 +752,6 @@ async fn restore_fails_quickly_when_s3_interrupted() {
 
     {
         let cleaner = DbFileCleaner::new(PATH);
-        // Set env vars that the meta store will read during server.start()
-        std::env::set_var("LIBSQL_BOTTOMLESS_ENDPOINT", "http://localhost:9000");
-        std::env::set_var("LIBSQL_BOTTOMLESS_AWS_ACCESS_KEY_ID", "bar");
-        std::env::set_var("LIBSQL_BOTTOMLESS_AWS_SECRET_ACCESS_KEY", "foo");
-        std::env::set_var("LIBSQL_BOTTOMLESS_AWS_DEFAULT_REGION", "us-east-1");
         let db_job = start_db(1, configure_server(&options, listener_addr, PATH).await);
 
         sleep(Duration::from_secs(2)).await;
