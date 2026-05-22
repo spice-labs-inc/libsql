@@ -26,6 +26,7 @@ exclude = [
 
 [workspace.package]
 version = "0.9.30"
+rust-version = "1.85"
 authors = ["the libSQL authors"]
 edition = "2021"
 license = "MIT"
