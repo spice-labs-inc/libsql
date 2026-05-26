@@ -1,13 +1,73 @@
-use std::path::Path;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
-static PORT_COUNTER: AtomicU16 = AtomicU16::new(0);
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static TEST_IMAGE_TAG: OnceLock<String> = OnceLock::new();
 
-fn next_port() -> u16 {
-    let counter = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
-    20000 + (counter % 10000)
+fn build_test_image() -> String {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .expect("CARGO_MANIFEST_DIR should have a parent");
+    let tag = "libsql-server:test".to_string();
+
+    // Check if image already exists
+    let check_output = std::process::Command::new("docker")
+        .args(["images", "-q", &tag])
+        .output()
+        .expect("failed to run docker images");
+
+    if !check_output.stdout.is_empty() {
+        return tag;
+    }
+
+    let output = std::process::Command::new("docker")
+        .arg("build")
+        .arg("-t")
+        .arg(&tag)
+        .arg("-f")
+        .arg(repo_root.join("Dockerfile"))
+        .arg(repo_root)
+        .output()
+        .expect("failed to run docker build");
+
+    if !output.status.success() {
+        panic!(
+            "docker build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    tag
+}
+
+fn get_test_image() -> &'static str {
+    TEST_IMAGE_TAG.get_or_init(|| build_test_image())
+}
+
+async fn docker_host_port(container_name: &str, container_port: u16) -> anyhow::Result<u16> {
+    let output = tokio::process::Command::new("docker")
+        .args(["port", container_name, &format!("{}", container_port)])
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "docker port failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    // Format: "0.0.0.0:49153"
+    let port = line
+        .trim()
+        .split(':')
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("unexpected docker port output: {}", line))?
+        .parse::<u16>()
+        .map_err(|e| anyhow::anyhow!("failed to parse port from '{}': {}", line, e))?;
+    Ok(port)
 }
 
 fn unique_id() -> String {
@@ -31,8 +91,6 @@ pub struct MinioFixture {
 impl MinioFixture {
     pub async fn start() -> anyhow::Result<Self> {
         let uid = unique_id();
-        let api_port = next_port();
-        let console_port = next_port();
         let container_name = format!("minio-test-{}", uid);
         let network_name = format!("sqld-net-{}", uid);
 
@@ -48,7 +106,7 @@ impl MinioFixture {
             );
         }
 
-        // Start minio container
+        // Start minio container with random host ports
         let run_output = tokio::process::Command::new("docker")
             .args([
                 "run",
@@ -58,9 +116,9 @@ impl MinioFixture {
                 "--network",
                 &network_name,
                 "-p",
-                &format!("{}:9000", api_port),
+                ":9000",
                 "-p",
-                &format!("{}:9001", console_port),
+                ":9001",
                 "-e",
                 "MINIO_ROOT_USER=minioadmin",
                 "-e",
@@ -84,6 +142,10 @@ impl MinioFixture {
                 String::from_utf8_lossy(&run_output.stderr)
             );
         }
+
+        // Discover dynamically assigned host ports
+        let api_port = docker_host_port(&container_name, 9000).await?;
+        let console_port = docker_host_port(&container_name, 9001).await?;
 
         // Wait for minio to be ready
         let client = reqwest::Client::new();
@@ -152,10 +214,6 @@ impl MinioFixture {
         })
     }
 
-    pub fn endpoint(&self) -> String {
-        format!("http://127.0.0.1:{}", self.api_port)
-    }
-
     pub fn internal_endpoint(&self) -> String {
         format!("http://{}:9000", self.container_name)
     }
@@ -174,7 +232,7 @@ impl MinioFixture {
         Ok(())
     }
 
-    pub async fn restart(&self) -> anyhow::Result<()> {
+    pub async fn restart(&mut self) -> anyhow::Result<()> {
         let output = tokio::process::Command::new("docker")
             .args(["start", &self.container_name])
             .output()
@@ -185,6 +243,9 @@ impl MinioFixture {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+        // Re-discover host ports after restart
+        self.api_port = docker_host_port(&self.container_name, 9000).await?;
+        self.console_port = docker_host_port(&self.container_name, 9001).await?;
         // Wait for minio to be ready
         let client = reqwest::Client::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -217,18 +278,19 @@ impl MinioFixture {
     }
 }
 
-pub struct SqldFixture<'a> {
-    minio: &'a MinioFixture,
+pub struct SqldFixture {
+    network_name: String,
+    internal_endpoint: String,
     http_port: u16,
     pub container_name: String,
 }
 
-impl<'a> SqldFixture<'a> {
-    pub fn new(minio: &'a MinioFixture) -> Self {
-        let http_port = next_port();
+impl SqldFixture {
+    pub fn new(minio: &MinioFixture) -> Self {
         Self {
-            minio,
-            http_port,
+            network_name: minio.network_name.clone(),
+            internal_endpoint: minio.internal_endpoint(),
+            http_port: 0,
             container_name: format!("sqld-test-{}", unique_id()),
         }
     }
@@ -241,7 +303,6 @@ impl<'a> SqldFixture<'a> {
             .await;
 
         let data_dir_str = data_dir.to_str().unwrap();
-        let network_name = &self.minio.network_name;
 
         let run_output = tokio::process::Command::new("docker")
             .args([
@@ -250,14 +311,11 @@ impl<'a> SqldFixture<'a> {
                 "--name",
                 &self.container_name,
                 "--network",
-                network_name,
+                &self.network_name,
                 "-p",
-                &format!("{}:8080", self.http_port),
+                ":8080",
                 "-e",
-                &format!(
-                    "LIBSQL_BOTTOMLESS_ENDPOINT={}",
-                    self.minio.internal_endpoint()
-                ),
+                &format!("LIBSQL_BOTTOMLESS_ENDPOINT={}", self.internal_endpoint),
                 "-e",
                 "LIBSQL_BOTTOMLESS_BUCKET=bottomless",
                 "-e",
@@ -270,9 +328,15 @@ impl<'a> SqldFixture<'a> {
                 "SQLD_ENABLE_BOTTOMLESS_REPLICATION=true",
                 "-e",
                 "SQLD_DB_PATH=/var/lib/sqld",
+                "-e",
+                "LIBSQL_BOTTOMLESS_S3_READ_TIMEOUT_SECS=5",
+                "-e",
+                "LIBSQL_BOTTOMLESS_S3_CONNECT_TIMEOUT_SECS=5",
+                "-e",
+                "LIBSQL_BOTTOMLESS_S3_OPERATION_ATTEMPT_TIMEOUT_SECS=10",
                 "-v",
                 &format!("{}:/var/lib/sqld", data_dir_str),
-                "ghcr.io/tursodatabase/libsql-server:latest",
+                get_test_image(),
             ])
             .output()
             .await?;
@@ -283,6 +347,8 @@ impl<'a> SqldFixture<'a> {
                 String::from_utf8_lossy(&run_output.stderr)
             );
         }
+
+        self.http_port = docker_host_port(&self.container_name, 8080).await?;
 
         Ok(())
     }
@@ -326,6 +392,7 @@ impl<'a> SqldFixture<'a> {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+        self.http_port = docker_host_port(&self.container_name, 8080).await?;
         Ok(())
     }
 

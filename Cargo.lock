@@ -651,9 +651,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-types"
-version = "1.2.0"
+version = "1.2.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfe321a6b21f5d8eabd0ade9c55d3d0335f3c3157fc2b3e87f05f34b539e4df5"
+checksum = "c7b8a53819e42f10d0821f56da995e1470b199686a1809168db6ca485665f042"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -914,6 +914,7 @@ dependencies = [
  "async-compression 0.4.11",
  "aws-config",
  "aws-sdk-s3",
+ "aws-smithy-types",
  "bytes",
  "chrono",
  "futures-core",
@@ -2927,7 +2928,7 @@ dependencies = [
 
 [[package]]
 name = "libsql"
-version = "0.10.0-pre.2"
+version = "0.10.0-pre.3"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2987,7 +2988,7 @@ dependencies = [
 
 [[package]]
 name = "libsql-ffi"
-version = "0.10.0-pre.2"
+version = "0.10.0-pre.3"
 dependencies = [
  "bindgen",
  "cc",
@@ -2998,7 +2999,7 @@ dependencies = [
 
 [[package]]
 name = "libsql-hrana"
-version = "0.10.0-pre.2"
+version = "0.10.0-pre.3"
 dependencies = [
  "base64 0.21.7",
  "bytes",
@@ -3009,7 +3010,7 @@ dependencies = [
 
 [[package]]
 name = "libsql-rusqlite"
-version = "0.10.0-pre.2"
+version = "0.10.0-pre.3"
 dependencies = [
  "bencher",
  "bitflags 2.6.0",
@@ -3153,7 +3154,7 @@ dependencies = [
 
 [[package]]
 name = "libsql-sys"
-version = "0.10.0-pre.2"
+version = "0.10.0-pre.3"
 dependencies = [
  "bytes",
  "libsql-ffi",
@@ -3184,7 +3185,7 @@ dependencies = [
 
 [[package]]
 name = "libsql_replication"
-version = "0.10.0-pre.2"
+version = "0.10.0-pre.3"
 dependencies = [
  "aes",
  "arbitrary",

@@ -51,8 +51,8 @@ async fn test_restore_completes_after_sqld_killed() {
     sqld.kill().await.expect("Failed to kill sqld");
 
     // Phase 4: Restart sqld - must complete restore
-    let endpoint2 = sqld.http_endpoint();
     sqld.restart().await.expect("Failed to restart sqld");
+    let endpoint2 = sqld.http_endpoint();
     sqld.wait_for_ready(Duration::from_secs(60))
         .await
         .expect("sqld did not become ready after interrupted restore");

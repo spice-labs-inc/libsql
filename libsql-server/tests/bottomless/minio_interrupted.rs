@@ -5,7 +5,7 @@ use std::time::Duration;
 async fn test_restore_completes_after_minio_killed() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let minio = MinioFixture::start().await.expect("Failed to start minio");
+    let mut minio = MinioFixture::start().await.expect("Failed to start minio");
 
     let data_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let mut sqld = SqldFixture::new(&minio);

@@ -36,10 +36,10 @@ async fn test_basic_restore() {
         .expect("Failed to cleanup dbs dir");
 
     // Phase 3: Start sqld - should restore from minio
-    let endpoint2 = sqld.http_endpoint();
     sqld.start(data_dir.path())
         .await
         .expect("Failed to restart sqld");
+    let endpoint2 = sqld.http_endpoint();
     sqld.wait_for_ready(Duration::from_secs(60))
         .await
         .expect("sqld did not become ready after restore");
