@@ -219,6 +219,12 @@ fn replica_lazy_creation() {
     });
 
     sim.client("client", async move {
+        let client = Client::new();
+        // wait for replica to start up before connecting
+        while client.get("http://test.replica:8080/").await.is_err() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
         let db =
             Database::open_remote_with_connector("http://test.replica:8080", "", TurmoilConnector)
                 .unwrap();
@@ -299,6 +305,12 @@ fn replica_interactive_transaction() {
     });
 
     sim.client("client", async move {
+        let client = Client::new();
+        // wait for replica to start up before connecting
+        while client.get("http://replica:8080/").await.is_err() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
         let db = Database::open_remote_with_connector("http://replica:8080", "", TurmoilConnector)
             .unwrap();
         let conn = db.connect().unwrap();
