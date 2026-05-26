@@ -1107,12 +1107,7 @@ impl Replicator {
         }
         let generation = self.generation()?;
         let start_ts = Instant::now();
-        let client = self.client.clone();
         let change_counter = self.read_change_counter()?;
-        let snapshot_req = client.put_object().bucket(self.bucket.clone()).key(format!(
-            "{}-{}/db.{}",
-            self.db_name, generation, self.use_compression
-        ));
 
         /* FIXME: we can't rely on the change counter in WAL mode:
          ** "In WAL mode, changes to the database are detected using the wal-index and
@@ -1120,24 +1115,21 @@ impl Replicator {
          ** incremented on each transaction in WAL mode."
          ** Instead, we need to consult WAL checksums.
          */
-        let change_counter_key = format!("{}-{}/.changecounter", self.db_name, generation);
-        let change_counter_req = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(change_counter_key)
-            .body(ByteStream::from(Bytes::copy_from_slice(
-                change_counter.as_ref(),
-            )));
         let snapshot_notifier = self.snapshot_notifier.clone();
         let compression = self.use_compression;
         let db_path = PathBuf::from(self.db_path.clone());
         let db_name = self.db_name.clone();
+        let bucket = self.bucket.clone();
+        let client = self.client.clone();
         let handle = tokio::spawn(async move {
             tracing::trace!("Start snapshotting generation {}", generation);
             let start = Instant::now();
-            let body = match Self::maybe_compress_main_db_file(&db_path, compression).await {
-                Ok(file) => file,
+            let body_path = match Self::maybe_compress_main_db_file(&db_path, compression).await {
+                Ok(_) => match compression {
+                    CompressionKind::None => db_path.clone(),
+                    CompressionKind::Gzip => Self::db_compressed_path(&db_path, "gz"),
+                    CompressionKind::Zstd => Self::db_compressed_path(&db_path, "zstd"),
+                },
                 Err(e) => {
                     tracing::error!(
                         "Failed to compress db file (generation `{}`, path: `{}`): {:?}",
@@ -1149,25 +1141,58 @@ impl Replicator {
                     return;
                 }
             };
-            let mut result = snapshot_req.body(body).send().await;
-            if let Err(e) = result {
+            let snapshot_key = format!("{}-{}/db.{}", db_name, generation, compression);
+            let mut result = client
+                .put_object()
+                .bucket(&bucket)
+                .key(&snapshot_key)
+                .body(ByteStream::from_path(&body_path).await.unwrap())
+                .send()
+                .await;
+            let mut retries = 0;
+            while let Err(e) = result {
+                retries += 1;
                 tracing::error!(
-                    "Failed to upload snapshot for generation {}: {:?}",
+                    "Failed to upload snapshot for generation {}: {:?}, will retry after 1 second (attempt {})",
                     generation,
-                    e
+                    e,
+                    retries
                 );
-                let _ = snapshot_notifier.send(Err(e.into()));
-                return;
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                result = client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&snapshot_key)
+                    .body(ByteStream::from_path(&body_path).await.unwrap())
+                    .send()
+                    .await;
             }
-            result = change_counter_req.send().await;
-            if let Err(e) = result {
+            let change_counter_key = format!("{}-{}/.changecounter", db_name, generation);
+            result = client
+                .put_object()
+                .bucket(&bucket)
+                .key(change_counter_key.clone())
+                .body(ByteStream::from(Bytes::copy_from_slice(
+                    change_counter.as_ref(),
+                )))
+                .send()
+                .await;
+            while let Err(e) = result {
                 tracing::error!(
-                    "Failed to upload change counter for generation {}: {:?}",
+                    "Failed to upload change counter for generation {}: {:?}, will retry after 1 second",
                     generation,
                     e
                 );
-                let _ = snapshot_notifier.send(Err(e.into()));
-                return;
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                result = client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(change_counter_key.clone())
+                    .body(ByteStream::from(Bytes::copy_from_slice(
+                        change_counter.as_ref(),
+                    )))
+                    .send()
+                    .await;
             }
             let _ = snapshot_notifier.send(Ok(Some(generation)));
             let elapsed = Instant::now() - start;

@@ -9,7 +9,6 @@ use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::Once;
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
@@ -26,37 +25,10 @@ use crate::Server;
 
 const S3_URL: &str = "http://localhost:9000/";
 
-static S3_SERVER: Once = Once::new();
-
-async fn start_s3_server() {
-    S3_SERVER.call_once(|| {
-        let tmp = std::env::temp_dir().join(format!("s3s-{}", Uuid::new_v4().as_simple()));
-
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        tracing::info!("starting mock s3 server with path: {}", tmp.display());
-
-        let s3_impl = s3s_fs::FileSystem::new(tmp).unwrap();
-
-        let auth = SimpleAuth::from_single("bar", "foo");
-
-        let mut s3 = S3ServiceBuilder::new(s3_impl);
-        s3.set_auth(auth);
-        let s3 = s3.build().into_shared().into_make_service();
-
-        // #[tokio::test] creates a fresh runtime per test and aborts all tasks
-        // when the test finishes. We must run the mock S3 server on a separate
-        // runtime so it survives past any individual test's lifetime.
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async move {
-                let addr = ([127, 0, 0, 1], 9000).into();
-                hyper::Server::bind(&addr).serve(s3).await.unwrap();
-            });
-        });
-    });
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
+/// Start a mock S3 server on port 9000 that can be gracefully shut down.
+fn start_s3_server() -> S3ServerHandle {
+    let tmp = std::env::temp_dir().join(format!("s3s-{}", Uuid::now_v7().as_simple()));
+    start_stoppable_s3_server(9000, tmp)
 }
 
 /// returns a future that once polled will shutdown the server and wait for cleanup
@@ -125,7 +97,7 @@ async fn configure_server(
 async fn backup_restore() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    start_s3_server().await;
+    let _s3 = start_s3_server();
 
     const DB_ID: &str = "testbackuprestore";
     const BUCKET: &str = "testbackuprestore";
@@ -269,7 +241,7 @@ async fn backup_restore() {
 async fn rollback_restore() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    start_s3_server().await;
+    let _s3 = start_s3_server();
 
     const DB_ID: &str = "testrollbackrestore";
     const BUCKET: &str = "testrollbackrestore";
@@ -770,7 +742,7 @@ async fn restore_fails_quickly_when_s3_interrupted() {
     // Step 1: Start the mock S3 server and create a database with bottomless replication.
     // We set aws_endpoint explicitly so this test is immune to env vars left behind by
     // other tests running in parallel.
-    start_s3_server().await;
+    let _s3 = start_s3_server();
 
     // Build options without from_env() to avoid cross-test env var pollution.
     let options = bottomless::replicator::Options {
