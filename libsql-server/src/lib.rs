@@ -648,42 +648,70 @@ where
             }
         }
 
-        // configure rpc server
-        if let Some(config) = self.rpc_server_config.take() {
-            let proxy_service =
-                ProxyService::new(namespace_store.clone(), None, self.disable_namespaces);
-            // Garbage collect proxy clients every 30 seconds
-            task_manager.spawn_until_shutdown({
-                let clients = proxy_service.clients();
-                async move {
-                    loop {
-                        tokio::time::sleep(Duration::from_secs(30)).await;
-                        rpc::proxy::garbage_collect(&mut *clients.write().await).await;
-                    }
-                }
-            });
-
-            let replication_service = make_replication_svc(
-                namespace_store.clone(),
-                Some(user_auth_strategy.clone()),
-                idle_shutdown_kicker.clone(),
-                false,
-                true,
-            );
-
-            task_manager.spawn_until_shutdown(run_rpc_server(
-                proxy_service,
-                config.acceptor,
-                config.tls_config,
-                idle_shutdown_kicker.clone(),
-                replication_service, // internal replicaton service
-            ));
-        }
-
         let shutdown_timeout = self.shutdown_timeout.clone();
         let shutdown = self.shutdown.clone();
         let service_shutdown = Arc::new(Notify::new());
-        // setup user-facing rpc services
+
+        // Build the user HTTP service early so the admin API can reference it,
+        // but don't bind the acceptors yet.
+        let (hrana_http_srv, user_api_idle_shutdown_kicker) = {
+            let user_http = UserApi {
+                http_acceptor: None::<A>,
+                hrana_ws_acceptor: None::<A>,
+                user_auth_strategy: user_auth_strategy.clone(),
+                namespaces: namespace_store.clone(),
+                idle_shutdown_kicker: idle_shutdown_kicker.clone(),
+                proxy_service: ProxyService::new(
+                    namespace_store.clone(),
+                    Some(user_auth_strategy.clone()),
+                    self.disable_namespaces,
+                ),
+                replication_service: make_replication_svc(
+                    namespace_store.clone(),
+                    Some(user_auth_strategy.clone()),
+                    idle_shutdown_kicker.clone(),
+                    true,
+                    false,
+                ),
+                disable_default_namespace: self.disable_default_namespace,
+                disable_namespaces: self.disable_namespaces,
+                max_response_size: self.db_config.max_response_size,
+                enable_console: self.user_api_config.enable_http_console,
+                self_url: self.user_api_config.self_url.clone(),
+                primary_url: self.user_api_config.primary_url.clone(),
+            };
+
+            let mut tm = TaskManager::new();
+            let srv = user_http.configure(&mut tm);
+            (srv, idle_shutdown_kicker.clone())
+        };
+
+        // Start the admin API immediately so operators can inspect state
+        // while the initial restore / replication is still in progress.
+        if let Some(AdminApiConfig {
+            acceptor,
+            connector,
+            disable_metrics,
+            auth_key,
+        }) = self.admin_api_config.take()
+        {
+            task_manager.spawn_with_shutdown_notify(|shutdown| {
+                http::admin::run(
+                    acceptor,
+                    hrana_http_srv.clone(),
+                    namespace_store.clone(),
+                    connector,
+                    disable_metrics,
+                    shutdown,
+                    auth_key.map(Into::into),
+                    self.set_log_level.take(),
+                )
+            });
+        }
+
+        // Eagerly create the default namespace to ensure any initial
+        // restore or replication completes before we start accepting
+        // user connections.
         match db_kind {
             DatabaseKind::Primary => {
                 // The migration scheduler is only useful on the primary
@@ -703,11 +731,57 @@ where
                         )
                         .await?;
                 }
+            }
+            DatabaseKind::Replica => {
+                namespace_store
+                    .create(
+                        NamespaceName::default(),
+                        namespace::RestoreOption::Latest,
+                        Default::default(),
+                    )
+                    .await?;
+            }
+        };
 
+        // configure rpc server
+        if let Some(config) = self.rpc_server_config.take() {
+            let proxy_service =
+                ProxyService::new(namespace_store.clone(), None, self.disable_namespaces);
+            // Garbage collect proxy clients every 30 seconds
+            task_manager.spawn_until_shutdown({
+                let clients = proxy_service.clients();
+                async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        rpc::proxy::garbage_collect(&mut *clients.write().await).await;
+                    }
+                }
+            });
+
+            let replication_service = make_replication_svc(
+                namespace_store.clone(),
+                Some(user_auth_strategy.clone()),
+                user_api_idle_shutdown_kicker.clone(),
+                false,
+                true,
+            );
+
+            task_manager.spawn_until_shutdown(run_rpc_server(
+                proxy_service,
+                config.acceptor,
+                config.tls_config,
+                user_api_idle_shutdown_kicker.clone(),
+                replication_service, // internal replicaton service
+            ));
+        }
+
+        // setup user-facing rpc services
+        match db_kind {
+            DatabaseKind::Primary => {
                 let replication_svc = make_replication_svc(
                     namespace_store.clone(),
                     Some(user_auth_strategy.clone()),
-                    idle_shutdown_kicker.clone(),
+                    user_api_idle_shutdown_kicker.clone(),
                     true,
                     false, // external replication service
                 );
@@ -731,7 +805,7 @@ where
 
                 self.make_services(
                     namespace_store.clone(),
-                    idle_shutdown_kicker,
+                    user_api_idle_shutdown_kicker,
                     proxy_svc,
                     replication_svc,
                     user_auth_strategy.clone(),
@@ -751,7 +825,7 @@ where
 
                 self.make_services(
                     namespace_store.clone(),
-                    idle_shutdown_kicker,
+                    user_api_idle_shutdown_kicker,
                     proxy_svc,
                     replication_svc,
                     user_auth_strategy,

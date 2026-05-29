@@ -4,12 +4,13 @@ on:
   push:
     branches:
       - "main"
+      - "as/add-timeout"
     tags:
       - libsql-server-v*.*.*
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: tursodatabase/libsql-server
+  IMAGE_NAME: spice-labs-inc/libsql-server
 
 jobs:
   build-amd64:
