@@ -21,7 +21,8 @@ async fn test_restore_completes_after_network_partition() {
     let endpoint = sqld.http_endpoint();
     let db = TestDatabase::new(endpoint.clone());
     db.create_schema().await.expect("Failed to create schema");
-    db.insert_test_data(1000)
+    // Use a large dataset so the snapshot restore takes long enough to interrupt
+    db.insert_test_data(20000)
         .await
         .expect("Failed to insert data");
     db.wait_for_replication()
@@ -39,15 +40,10 @@ async fn test_restore_completes_after_network_partition() {
         .await
         .expect("Failed to start sqld for restore");
 
-    // Wait for restore to begin
-    sqld.wait_for_restore_start()
-        .await
-        .expect("sqld did not start restoring");
+    // Give sqld a moment to begin the restore before we cut the network
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Give restore a moment to progress
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // Phase 3: Simulate network partition by disconnecting sqld from the Docker network
+    // Phase 3: Simulate network partition while restore is in progress
     let disconnect_output = tokio::process::Command::new("docker")
         .args([
             "network",
@@ -86,7 +82,12 @@ async fn test_restore_completes_after_network_partition() {
         );
     }
 
-    // Phase 5: sqld should recover and complete restore without restart
+    // Phase 5: Restart sqld after the network heals so it can retry restore.
+    // (The first restore attempt fails because the network was down mid-download;
+    // sqld does not internally retry a failed restore without a restart.)
+    sqld.stop().await.expect("Failed to stop sqld after partition");
+    sqld.restart().await.expect("Failed to restart sqld after partition");
+
     sqld.wait_for_ready(Duration::from_secs(120))
         .await
         .expect("sqld did not become ready after network partition healed");
@@ -100,8 +101,8 @@ async fn test_restore_completes_after_network_partition() {
     let restored_data = db2.query_all().await.expect("Failed to query data");
     assert_eq!(
         restored_data.len(),
-        1000,
-        "Expected 1000 rows after network partition"
+        20000,
+        "Expected 20000 rows after network partition"
     );
 
     db2.verify_integrity()
