@@ -1,54 +1,88 @@
-# Contributing to libsql
+# Contributing to This Project
 
-Thank you for your interest in contributing to libsql! We welcome contributions from the community to make this project better.
+Thank you for your interest in this project. We welcome all kinds of contributions: code, documentation, bug reports, feature requests, and more. This guide will help you get started. We ask that you engage in good faith, honesty, and integrity, and respect that the maintainers make the final decisions on this project.
 
-Before you start, please take a moment to review the guidelines outlined below.
+---
 
-## Code of Conduct
+## Reporting Bugs
 
-Please note that we have a Code of Conduct in place to ensure a positive and inclusive environment for everyone involved.
+Please include:
+- A clear, descriptive title
+- Steps to reproduce the issue
+- What you expected to happen versus what actually happened
+- Any relevant logs, screenshots, or files
+- Your environment (OS, software version, and how it was installed)
 
-### Getting Started
+Open a [new issue](../../issues/new) to report the problem.
 
-* Fork the repository.
-* Clone your forked repository to your local machine.
-* Create a new branch for your feature or bug fix: `git checkout -b feature-name`.
-* Make your changes and test thoroughly.
-* Commit your changes with descriptive commit messages.
-* Push your changes to your forked repository: `git push origin feature-name`.
-* Submit a pull request to the main branch of the original repository.
+---
 
-### Contribution Guidelines
+## Suggesting Features
 
-* All contributions should be well-documented and follow the existing code style.
-* Include tests for any new functionality or bug fixes.
-* Update documentation as necessary, including any relevant README or usage guides.
-* Maintain backward compatibility whenever possible.
-* Follow the Git commit message guidelines for consistent commit messages.
-* Review the existing issues and pull requests to avoid duplicating efforts.
+Please include:
+- A summary of the problem you are trying to solve
+- Why it is important or useful
+- A rough idea of how it could be implemented
 
-### Pull Request Process
+Open a [new issue](../../issues/new) to make the suggestion.
 
-* Ensure that your pull request addresses a specific issue.
-  * If there isn't an issue, consider creating one first.
-* Clearly describe the problem or feature in your pull request and reference the relevant issue.
-* Provide steps to reproduce and test your changes if applicable.
-* Ensure that your branch is up-to-date with the latest changes from the main branch.
-* All checks (tests, formatting, etc.) must pass before your pull request can be merged.
-* After addressing review comments, your pull request will be merged by a project maintainer.
+---
 
-### Documentation
+## Making Code Contributions
 
-Help us improve the project's documentation by fixing typos, clarifying language, or adding missing information. Documentation improvements can be submitted as pull requests.
+Follow the coding style used in the project:
+- The project has linters and formatters configured, so use them
+- Add or update tests if you change features or handle new cases
+- Run existing tests to ensure everything still works
+- Write clear commit messages that describe the changes:
 
-### Reporting Issues
+```bash
+   git commit -m "Handle timeouts in API client with retry backoff"
+   git push origin fix/handle-timeouts
+```
+- Longer commit messages are welcome when describing the approach, alternatives considered, or other useful details
+- Please keep commits as focused as possible. It is better to have two smaller commits for unrelated changes than one combined commit with a vague title such as "updates" or "changes"
 
-If you encounter a bug or have a suggestion for the project, please open an issue using the provided issue template. Include as much detail as possible to help us understand and address the problem.
+---
 
-### Getting Help
+## Tests and CI
 
-If you need assistance, have questions, or want to discuss ideas, you can:
+- Run the tests and linters against your changes
+- Reach out if you are unsure how to run the tests
 
-Join our Discord server and chat with the community.
-Mention @maintainer in your issue or pull request for a faster response from project maintainers.
-We appreciate your time and effort in contributing to libsql!
+---
+
+## Opening a Pull Request
+
+- Open your pull request against the `next` branch. We integrate changes into `next` before merging to `main` and creating tagged releases
+- Use the pull request template as a guide. Explain why you are making changes as clearly as you can
+- Link to any related issues
+- Be ready to discuss or make changes after review
+- Ensure CI passes on your PR and make any required changes
+
+---
+
+## Collaborating and Reviewing
+
+We use pull request reviews to discuss changes:
+- Code improvements or simplifications
+- Better naming or comments
+- Test coverage or performance notes
+- Alternate approaches
+- Formatting or documentation corrections
+
+---
+
+## Licensing
+
+All contributions must be compatible with the project's [license](LICENSE.txt), and you must have the legal right to contribute them. By submitting code, you agree to license it under the same terms.
+
+---
+
+## Thank You!
+
+Thank you for contributing. Whether you are fixing a typo, suggesting a feature, or rewriting a core component, your contribution helps and is greatly appreciated.
+
+For questions, feel free to open an issue, start a discussion, or join the community on Matrix at [#spice-labs:matrix.org](https://matrix.to/#/#spice-labs:matrix.org).
+
+---
