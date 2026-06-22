@@ -7,6 +7,7 @@ RUN apk add --no-cache \
         musl-dev
 
 WORKDIR /sqld
+ENV RUSTFLAGS='-C target-feature=-crt-static --cfg tokio_unstable'
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -16,7 +17,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # runtime
 FROM alpine
-RUN apk add --no-cache bash su-exec ca-certificates
+RUN apk add --no-cache bash su-exec ca-certificates libgcc
 
 EXPOSE 5001 8080
 VOLUME [ "/var/lib/sqld" ]

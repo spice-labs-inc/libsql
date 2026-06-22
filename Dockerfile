@@ -26,6 +26,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 ARG BUILD_DEBUG=false
 ENV CARGO_PROFILE_RELEASE_DEBUG=$BUILD_DEBUG
+ENV RUSTFLAGS='-C target-feature=-crt-static --cfg tokio_unstable'
 COPY --from=planner /recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json -p libsql-server -p bottomless-cli
 COPY . .
@@ -39,7 +40,7 @@ RUN cargo build -p bottomless-cli --release
 
 # runtime
 FROM alpine
-RUN apk add --no-cache bash su-exec ca-certificates
+RUN apk add --no-cache bash su-exec ca-certificates libgcc
 
 EXPOSE 5001 8080
 VOLUME [ "/var/lib/sqld" ]
