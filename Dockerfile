@@ -27,7 +27,7 @@ FROM chef AS builder
 ARG BUILD_DEBUG=false
 ENV CARGO_PROFILE_RELEASE_DEBUG=$BUILD_DEBUG
 COPY --from=planner /recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json -p libsql-server -p bottomless-cli
 COPY . .
 ARG ENABLE_FEATURES=""
 RUN if [ "$ENABLE_FEATURES" == "" ]; then \
