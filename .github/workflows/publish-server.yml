@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - "main"
-      - "as/add-timeout"
+      - "as/alpine"
     tags:
       - libsql-server-v*.*.*
 
