@@ -470,23 +470,33 @@ fn atomic_rename(p1: impl AsRef<Path>, p2: impl AsRef<Path>) -> anyhow::Result<(
 
 #[cfg(target_os = "linux")]
 fn atomic_rename(p1: impl AsRef<Path>, p2: impl AsRef<Path>) -> anyhow::Result<()> {
-    use anyhow::Context;
-    use nix::fcntl::{renameat2, RenameFlags};
+    use std::ffi::CString;
+    use std::os::unix::prelude::OsStrExt;
 
-    renameat2(
-        None,
-        p1.as_ref(),
-        None,
-        p2.as_ref(),
-        RenameFlags::RENAME_EXCHANGE,
-    )
-    .with_context(|| {
-        format!(
-            "failed to perform snapshot file swap {} -> {}",
-            p1.as_ref().display(),
-            p2.as_ref().display()
+    const RENAME_EXCHANGE: u32 = 2;
+
+    let cp1 = CString::new(p1.as_ref().as_os_str().as_bytes())?;
+    let cp2 = CString::new(p2.as_ref().as_os_str().as_bytes())?;
+
+    let ret = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_renameat2,
+            nix::libc::AT_FDCWD,
+            cp1.as_ptr(),
+            nix::libc::AT_FDCWD,
+            cp2.as_ptr(),
+            RENAME_EXCHANGE,
         )
-    })?;
+    };
+
+    if ret != 0 {
+        bail!(
+            "failed to perform snapshot file swap {} -> {}: {ret}, errno: {}",
+            p1.as_ref().display(),
+            p2.as_ref().display(),
+            std::io::Error::last_os_error()
+        );
+    }
 
     Ok(())
 }
