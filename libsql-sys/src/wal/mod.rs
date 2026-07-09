@@ -198,6 +198,7 @@ pub trait Wal {
 
     fn savepoint(&mut self, rollback_data: &mut [u32]);
     fn savepoint_undo(&mut self, rollback_data: &mut [u32]) -> Result<()>;
+    fn savepoint_forget(&mut self, _rollback_data: &mut [u32]) {}
 
     fn frame_count(&self, locked: i32) -> Result<u32>;
 

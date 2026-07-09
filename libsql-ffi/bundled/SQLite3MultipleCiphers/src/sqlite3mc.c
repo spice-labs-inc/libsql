@@ -3,7 +3,7 @@
 ** Purpose:     Amalgamation of the SQLite3 Multiple Ciphers encryption extension for SQLite
 ** Author:      Ulrich Telle
 ** Created:     2020-02-28
-** Copyright:   (c) 2006-2022 Ulrich Telle
+** Copyright:   (c) 2006-2024 Ulrich Telle
 ** License:     MIT
 */
 
@@ -51,8 +51,15 @@
 #define SQLITE_EXTRA_INIT sqlite3mc_initialize
 #define SQLITE_EXTRA_SHUTDOWN sqlite3mc_shutdown
 
-int sqlite3mc_initialize(const char* arg);
-void sqlite3mc_shutdown(void);
+/*
+** Declare all internal functions as 'static' unless told otherwise
+*/
+#ifndef SQLITE_PRIVATE
+#define SQLITE_PRIVATE static
+#endif
+
+SQLITE_PRIVATE int sqlite3mc_initialize(const char* arg);
+SQLITE_PRIVATE void sqlite3mc_shutdown(void);
 
 /*
 ** To enable the extension functions define SQLITE_ENABLE_EXTFUNC on compiling this module
@@ -65,14 +72,10 @@ void sqlite3mc_shutdown(void);
 */
 
 /*
-** Enable the user authentication feature
+** Disable the user authentication feature by default
 */
+#ifdef SQLITE_USER_AUTHENTICATION
 #if !SQLITE_USER_AUTHENTICATION
-/* Option not defined or explicitly disabled */
-#ifndef SQLITE_USER_AUTHENTICATION
-/* Option not defined, therefore enable by default */
-#define SQLITE_USER_AUTHENTICATION 1
-#else
 /* Option defined and disabled, therefore undefine option */
 #undef SQLITE_USER_AUTHENTICATION
 #endif
@@ -117,13 +120,13 @@ void sqlite3mc_shutdown(void);
 #include <windows.h>
 
 /* SQLite functions only needed on Win32 */
-extern SQLITE_API void sqlite3_win32_write_debug(const char*, int);
-extern SQLITE_API char *sqlite3_win32_unicode_to_utf8(LPCWSTR);
-extern SQLITE_API char *sqlite3_win32_mbcs_to_utf8(const char*);
-extern SQLITE_API char *sqlite3_win32_mbcs_to_utf8_v2(const char*, int);
-extern SQLITE_API char *sqlite3_win32_utf8_to_mbcs(const char*);
-extern SQLITE_API char *sqlite3_win32_utf8_to_mbcs_v2(const char*, int);
-extern SQLITE_API LPWSTR sqlite3_win32_utf8_to_unicode(const char*);
+SQLITE_API void sqlite3_win32_write_debug(const char*, int);
+SQLITE_API char *sqlite3_win32_unicode_to_utf8(LPCWSTR);
+SQLITE_API char *sqlite3_win32_mbcs_to_utf8(const char*);
+SQLITE_API char *sqlite3_win32_mbcs_to_utf8_v2(const char*, int);
+SQLITE_API char *sqlite3_win32_utf8_to_mbcs(const char*);
+SQLITE_API char *sqlite3_win32_utf8_to_mbcs_v2(const char*, int);
+SQLITE_API LPWSTR sqlite3_win32_utf8_to_unicode(const char*);
 #endif
 
 /*
@@ -132,7 +135,7 @@ extern SQLITE_API LPWSTR sqlite3_win32_utf8_to_unicode(const char*);
 #include "sqlite3.c"
 
 /*
-** Include SQLite3MultiCipher components 
+** Include SQLite3MultiCipher components
 */
 #include "sqlite3mc_config.h"
 #include "sqlite3mc.h"
@@ -164,10 +167,6 @@ sqlite3mcVersion(sqlite3_context* context, int argc, sqlite3_value** argv)
 SQLITE_PRIVATE void sqlite3mcSetMemorySecurity(int value);
 SQLITE_PRIVATE int sqlite3mcGetMemorySecurity();
 
-#ifndef SQLITE3MC_USE_RANDOM_FILL_MEMORY
-#define SQLITE3MC_USE_RANDOM_FILL_MEMORY 0
-#endif
-
 /* Memory locking is currently not supported */
 #ifdef SQLITE3MC_ENABLE_MEMLOCK
 #undef SQLITE3MC_ENABLE_MEMLOCK
@@ -183,14 +182,14 @@ SQLITE_PRIVATE int sqlite3mcGetMemorySecurity();
 #include "sha1.c"
 #include "sha2.c"
 
-#if HAVE_CIPHER_CHACHA20 || HAVE_CIPHER_SQLCIPHER
+#if HAVE_CIPHER_CHACHA20 || HAVE_CIPHER_SQLCIPHER || HAVE_CIPHER_ASCON128
 #include "fastpbkdf2.c"
 
 /* Prototypes for several crypto functions to make pedantic compilers happy */
-void chacha20_xor(void* data, size_t n, const uint8_t key[32], const uint8_t nonce[12], uint32_t counter);
-void poly1305(const uint8_t* msg, size_t n, const uint8_t key[32], uint8_t tag[16]);
-int poly1305_tagcmp(const uint8_t tag1[16], const uint8_t tag2[16]);
-void chacha20_rng(void* out, size_t n);
+SQLITE_PRIVATE void chacha20_xor(void* data, size_t n, const uint8_t key[32], const uint8_t nonce[12], uint32_t counter);
+SQLITE_PRIVATE void poly1305(const uint8_t* msg, size_t n, const uint8_t key[32], uint8_t tag[16]);
+SQLITE_PRIVATE int poly1305_tagcmp(const uint8_t tag1[16], const uint8_t tag2[16]);
+SQLITE_PRIVATE void chacha20_rng(void* out, size_t n);
 
 #include "chacha20poly1305.c"
 #endif
@@ -456,7 +455,7 @@ sqlite3_extfunc_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *p
 #endif
 
 static int
-mcCheckValidName(char* name)
+mcCheckValidName(const char* name)
 {
   size_t nl;
   if (!name)
@@ -576,9 +575,10 @@ sqlite3mcRegisterCipher(const CipherDescriptor* desc, const CipherParams* params
     /* Copy parameters */
     for (n = 0; n < np; ++n)
     {
+      char* paramName = (char*) sqlite3_malloc((int)strlen(params[n].m_name) + 1);
+      strcpy(paramName, params[n].m_name);
       cipherParams[n] = params[n];
-      cipherParams[n].m_name = (char*) sqlite3_malloc((int) strlen(params[n].m_name) + 1);
-      strcpy(cipherParams[n].m_name, params[n].m_name);
+      cipherParams[n].m_name = paramName;
     }
     /* Add sentinel */
     cipherParams[n] = params[n];
@@ -661,14 +661,15 @@ sqlite3mcTermCipherTables()
       CipherParams* params = globalCodecParameterTable[n].m_params;
       for (k = 0; params[k].m_name[0] != 0; ++k)
       {
-        sqlite3_free(params[k].m_name);
+        sqlite3_free((char*) params[k].m_name);
       }
       sqlite3_free(globalCodecParameterTable[n].m_params);
     }
   }
+  globalCipherCount = 0;
 }
 
-int
+SQLITE_PRIVATE int
 sqlite3mc_initialize(const char* arg)
 {
   int rc = sqlite3mcInitCipherTables();
@@ -800,7 +801,7 @@ sqlite3mc_initialize(const char* arg)
   return rc;
 }
 
-void
+SQLITE_PRIVATE void
 sqlite3mc_shutdown(void)
 {
   sqlite3mc_vfs_shutdown();

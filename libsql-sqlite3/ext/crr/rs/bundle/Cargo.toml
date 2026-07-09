@@ -41,3 +41,5 @@ omit_load_extension = [
   "crsql_fractindex_core/omit_load_extension",
   "crsql_core/omit_load_extension"
 ]
+
+[workspace]

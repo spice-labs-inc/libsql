@@ -16,3 +16,5 @@ bindgen = "0.68.1"
 loadable_extension = []
 static = []
 omit_load_extension = []
+
+[workspace]

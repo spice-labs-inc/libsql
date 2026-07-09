@@ -206,7 +206,7 @@ impl StreamResponseBuilder {
     }
 }
 
-/// Apply the response to the the builder, and return whether the builder need more steps
+/// Apply the response to the builder, and return whether the builder need more steps
 pub fn apply_program_resp_to_builder<B: QueryResultBuilder>(
     config: &QueryBuilderConfig,
     builder: &mut B,

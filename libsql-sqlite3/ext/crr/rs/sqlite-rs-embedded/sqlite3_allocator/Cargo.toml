@@ -16,3 +16,5 @@ sqlite3_capi = {version="0.1.0", path="../sqlite3_capi"}
 
 # dev dependencies for examples
 [dev-dependencies]
+
+[workspace]

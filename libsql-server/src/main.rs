@@ -153,7 +153,7 @@ struct Cli {
     heartbeat_auth: Option<String>,
 
     /// The heartbeat time period in seconds.
-    /// By default, the the period is 30 seconds.
+    /// By default, the period is 30 seconds.
     #[clap(long, env = "SQLD_HEARTBEAT_PERIOD_S", default_value = "30")]
     heartbeat_period_s: u64,
 

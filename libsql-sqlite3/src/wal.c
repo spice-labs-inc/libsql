@@ -44,7 +44,7 @@
 **    28: Checksum-2 (second part of checksum for first 24 bytes of header).
 **
 ** Immediately following the wal-header are zero or more frames. Each
-** frame consists of a 24-byte frame-header followed by a <page-size> bytes
+** frame consists of a 24-byte frame-header followed by <page-size> bytes
 ** of page data. The frame-header is six big-endian 32-bit unsigned
 ** integer values, as follows:
 **
@@ -2867,7 +2867,7 @@ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int *pCnt){
   SEH_INJECT_FAULT;
   if( !useWal && AtomicLoad(&pInfo->nBackfill)==pWal->hdr.mxFrame
 #ifdef SQLITE_ENABLE_SNAPSHOT
-   && (pWal->pSnapshot==0 || pWal->hdr.mxFrame==0)
+   && ((pWal->bGetSnapshot==0 && pWal->pSnapshot==0) || pWal->hdr.mxFrame==0)
 #endif
   ){
     /* The WAL has been completely backfilled (or it is empty).
@@ -3610,6 +3610,15 @@ static int sqlite3WalSavepointUndo(Wal *pWal, u32 *aWalData){
 }
 
 /*
+** Forget a WAL savepoint context that SQLite has destroyed. The built-in WAL
+** implementation does not retain any external state per savepoint.
+*/
+static void sqlite3WalSavepointForget(Wal *pWal, u32 *aWalData){
+  UNUSED_PARAMETER(pWal);
+  UNUSED_PARAMETER(aWalData);
+}
+
+/*
 ** This function is called just before writing a set of frames to the log
 ** file (see sqlite3WalFrames()). It checks to see if, instead of appending
 ** to the current log file, it is possible to overwrite the start of the
@@ -4336,7 +4345,20 @@ static void sqlite3WalSnapshotOpen(
   Wal *pWal, 
   sqlite3_snapshot *pSnapshot
 ){
-  pWal->pSnapshot = (WalIndexHdr*)pSnapshot;
+  if( pSnapshot && ((WalIndexHdr*)pSnapshot)->iVersion==0 ){
+    /* iVersion==0 means that this is a call to sqlite3_snapshot_get().  In
+    ** this case set the bGetSnapshot flag so that if the call to
+    ** sqlite3_snapshot_get() is about to read transaction on this wal 
+    ** file, it does not take read-lock 0 if the wal file has been completely
+    ** checkpointed. Taking read-lock 0 would work, but then it would be
+    ** possible for a subsequent writer to destroy the snapshot even while 
+    ** this connection is holding its read-transaction open. This is contrary
+    ** to user expectations, so we avoid it by not taking read-lock 0. */
+    pWal->bGetSnapshot = 1;
+  }else{
+    pWal->pSnapshot = (WalIndexHdr*)pSnapshot;
+    pWal->bGetSnapshot = 0;
+  }
 }
 
 /*
@@ -4549,7 +4571,7 @@ static int sqlite3WalOpen(
     }
 
     out->pData = (wal_impl*) pRet;
-    out->methods.iVersion = 1;
+    out->methods.iVersion = 2;
     out->methods.xLimit = (void (*)(wal_impl *, long long))sqlite3WalLimit;
     out->methods.xBeginReadTransaction = (int (*)(wal_impl *, int *))sqlite3WalBeginReadTransaction;
     out->methods.xEndReadTransaction = (void (*)(wal_impl *))sqlite3WalEndReadTransaction;
@@ -4586,6 +4608,7 @@ static int sqlite3WalOpen(
     outWal->methods.xWriteLock = sqlite3WalWriteLock;
 #endif
     out->methods.xDb = (void (*)(wal_impl *, sqlite3 *))sqlite3WalDb;
+    out->methods.xSavepointForget = (void (*)(wal_impl *, unsigned int *))sqlite3WalSavepointForget;
 
     WALTRACE(("WAL%d: opened\n", pRet));
   }

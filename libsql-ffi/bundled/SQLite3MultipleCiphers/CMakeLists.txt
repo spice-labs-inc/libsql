@@ -32,7 +32,7 @@ OPTION(SQLITE_ENABLE_JSON1 "Enable extension 'json1'" ON)
 OPTION(SQLITE_ENABLE_RTREE "Enable extension 'rtree'" ON)
 OPTION(SQLITE_ENABLE_UUID "Enable extension 'uuid'" ON)
 OPTION(SQLITE_USE_URI "Enable the URI filename process logic" ON)
-OPTION(SQLITE_USER_AUTHENTICATION "Enable extension 'user authentication'" ON)
+OPTION(SQLITE_USER_AUTHENTICATION "Enable extension 'user authentication'" OFF)
 OPTION(SQLITE_ENABLE_PREUPDATE_HOOK "Enable preupdate hooks" OFF)
 OPTION(SQLITE_ENABLE_SESSION "Enable session extension" OFF)
 OPTION(SQLITE_SHELL_IS_UTF8 "Shell command line arguments in UTF-8 encoding" ON)
@@ -64,7 +64,6 @@ OPTION(SQLITE3MC_USE_SQLCIPHER_LEGACY "Use sqlcipher legacy mode as default" OFF
 
 # Additional memory security (filling freed memory allocations with zeros or random data)
 OPTION(SQLITE3MC_SECURE_MEMORY "Enable pragma to secure freed memory" OFF)
-OPTION(SQLITE3MC_USE_RANDOM_FILL_MEMORY "Fill freed memory with random data" OFF)
 
 # Omit AES hardware support
 OPTION(SQLITE3MC_OMIT_AES_HARDWARE_SUPPORT "Omit AES hardware support" OFF)
@@ -180,12 +179,6 @@ if(SQLITE3MC_SECURE_MEMORY)
   set(SQLITE3MC_BASE_DEFINITIONS 
     ${SQLITE3MC_BASE_DEFINITIONS}
     SQLITE3MC_SECURE_MEMORY=1
-  )
-endif()
-if(SQLITE3MC_USE_RANDOM_FILL_MEMORY)
-  set(SQLITE3MC_BASE_DEFINITIONS 
-    ${SQLITE3MC_BASE_DEFINITIONS}
-    SQLITE3MC_USE_RANDOM_FILL_MEMORY=1
   )
 endif()
 

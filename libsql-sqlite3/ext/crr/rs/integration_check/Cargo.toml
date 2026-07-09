@@ -24,3 +24,5 @@ cc = "1.0"
 libsql = ["crsql_bundle/libsql"]
 static = []
 omit_load_extension = []
+
+[workspace]

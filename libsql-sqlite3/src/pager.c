@@ -4111,6 +4111,7 @@ static int pagerAcquireMapPage(
       return SQLITE_NOMEM_BKPT;
     }
     p->pExtra = (void *)&p[1];
+    assert( EIGHT_BYTE_ALIGNMENT( p->pExtra ) );
     p->flags = PGHDR_MMAP;
     p->nRef = 1;
     p->pPager = pPager;
@@ -7064,6 +7065,14 @@ int sqlite3PagerSavepoint(Pager *pPager, int op, int iSavepoint){
     */
     nNew = iSavepoint + (( op==SAVEPOINT_RELEASE ) ? 0 : 1);
     for(ii=nNew; ii<pPager->nSavepoint; ii++){
+      if( pagerUseWal(pPager)
+       && pPager->wal->methods.iVersion>=2
+       && pPager->wal->methods.xSavepointForget
+      ){
+        pPager->wal->methods.xSavepointForget(
+            pPager->wal->pData, pPager->aSavepoint[ii].aWalData
+        );
+      }
       sqlite3BitvecDestroy(pPager->aSavepoint[ii].pInSavepoint);
     }
     pPager->nSavepoint = nNew;
@@ -7164,7 +7173,7 @@ sqlite3_file *sqlite3PagerFile(Pager *pPager){
 ** This will be either the rollback journal or the WAL file.
 */
 sqlite3_file *sqlite3PagerJrnlFile(Pager *pPager){
-#if SQLITE_OMIT_WAL
+#ifdef SQLITE_OMIT_WAL
   return pPager->jfd;
 #else
   return pagerUseWal(pPager) ? pPager->wal->methods.xFile(pPager->wal->pData) : pPager->jfd;

@@ -89,6 +89,10 @@ impl<T: WrapWal<W>, W: Wal> Wal for WalRef<T, W> {
         unsafe { (*self.wrapper).savepoint_undo(&mut *self.wrapped, rollback_data) }
     }
 
+    fn savepoint_forget(&mut self, rollback_data: &mut [u32]) {
+        unsafe { (*self.wrapper).savepoint_forget(&mut *self.wrapped, rollback_data) }
+    }
+
     fn frame_count(&self, locked: i32) -> super::Result<u32> {
         unsafe { (*self.wrapper).frame_count(&*self.wrapped, locked) }
     }
@@ -272,6 +276,11 @@ where
             .savepoint_undo(&mut self.wrapped, rollback_data)
     }
 
+    fn savepoint_forget(&mut self, rollback_data: &mut [u32]) {
+        self.wrapper
+            .savepoint_forget(&mut self.wrapped, rollback_data)
+    }
+
     fn frame_count(&self, locked: i32) -> super::Result<u32> {
         self.wrapper.frame_count(&self.wrapped, locked)
     }
@@ -407,6 +416,10 @@ pub trait WrapWal<W: Wal> {
 
     fn savepoint_undo(&mut self, wrapped: &mut W, rollback_data: &mut [u32]) -> super::Result<()> {
         wrapped.savepoint_undo(rollback_data)
+    }
+
+    fn savepoint_forget(&mut self, wrapped: &mut W, rollback_data: &mut [u32]) {
+        wrapped.savepoint_forget(rollback_data)
     }
 
     fn frame_count(&self, wrapped: &W, locked: i32) -> super::Result<u32> {
@@ -657,6 +670,14 @@ where
         self.0.savepoint_undo(&mut r, rollback_data)
     }
 
+    fn savepoint_forget(&mut self, wrapped: &mut W, rollback_data: &mut [u32]) {
+        let mut r = WalRef {
+            wrapper: &mut self.1,
+            wrapped,
+        };
+        self.0.savepoint_forget(&mut r, rollback_data)
+    }
+
     fn insert_frames(
         &mut self,
         wrapped: &mut W,
@@ -876,6 +897,13 @@ impl<T: WrapWal<W>, W: Wal> WrapWal<W> for Option<T> {
         match self {
             Some(t) => t.savepoint_undo(wrapped, rollback_data),
             None => wrapped.savepoint_undo(rollback_data),
+        }
+    }
+
+    fn savepoint_forget(&mut self, wrapped: &mut W, rollback_data: &mut [u32]) {
+        match self {
+            Some(t) => t.savepoint_forget(wrapped, rollback_data),
+            None => wrapped.savepoint_forget(rollback_data),
         }
     }
 

@@ -28,15 +28,15 @@ FROM chef AS builder
 ARG BUILD_DEBUG=false
 ENV CARGO_PROFILE_RELEASE_DEBUG=$BUILD_DEBUG
 COPY --from=planner /recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json
 COPY . .
 ARG ENABLE_FEATURES=""
 RUN if [ "$ENABLE_FEATURES" == "" ]; then \
-        cargo build -p libsql-server --release ; \
+        cargo build -p libsql-server --release --locked ; \
     else \
-        cargo build -p libsql-server --features "$ENABLE_FEATURES" --release ; \
+        cargo build -p libsql-server --features "$ENABLE_FEATURES" --release --locked ; \
     fi
-RUN cargo build -p bottomless-cli --release
+RUN cargo build -p bottomless-cli --release --locked
 
 # official gosu install instruction (https://github.com/tianon/gosu/blob/master/INSTALL.md)
 FROM debian:bullseye-slim as gosu

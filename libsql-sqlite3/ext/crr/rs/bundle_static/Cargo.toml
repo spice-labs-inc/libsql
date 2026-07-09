@@ -33,3 +33,5 @@ static = [
 omit_load_extension = [
   "crsql_bundle/omit_load_extension"
 ]
+
+[workspace]

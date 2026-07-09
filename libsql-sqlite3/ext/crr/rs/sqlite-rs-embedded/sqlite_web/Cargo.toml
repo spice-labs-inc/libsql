@@ -14,3 +14,5 @@ sqlite_nostd = { path="../sqlite_nostd"}
 loadable_extension = ["sqlite_nostd/loadable_extension"]
 static = ["sqlite_nostd/static"]
 
+
+[workspace]

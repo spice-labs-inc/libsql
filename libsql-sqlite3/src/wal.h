@@ -38,7 +38,7 @@ typedef struct wal_impl wal_impl;
 typedef struct wal_manager_impl wal_manager_impl;
 
 typedef struct libsql_wal_methods {
-  int iVersion; /* Current version is 1, versioning is here for backward compatibility */
+  int iVersion; /* Current version is 2, versioning is here for backward compatibility */
 
   /* Set the limiting size of a WAL file. */
   void (*xLimit)(wal_impl* pWal, long long limit);
@@ -140,6 +140,9 @@ typedef struct libsql_wal_methods {
   int (*xWriteLock)(wal_impl* pWal, int bLock);
 
   void (*xDb)(wal_impl* pWal, sqlite3 *db);
+
+  /* Forget a previously opened savepoint that SQLite no longer needs. */
+  void (*xSavepointForget)(wal_impl* pWal, unsigned int *aWalData);
 } libsql_wal_methods;
 
 
@@ -225,6 +228,7 @@ typedef struct sqlite3_wal {
   unsigned int nCkpt;                 /* Checkpoint sequence counter in the wal-header */
   unsigned char lockError;            /* True if a locking error has occurred */
   WalIndexHdr *pSnapshot;             /* Start transaction here if not NULL */
+  int bGetSnapshot;                   /* Transaction opened for sqlite3_get_snapshot() */
   sqlite3 *db;
 } sqlite3_wal;
 

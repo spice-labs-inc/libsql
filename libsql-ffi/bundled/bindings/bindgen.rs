@@ -23,11 +23,10 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 
-pub const __GNUC_VA_LIST: i32 = 1;
-pub const SQLITE_VERSION: &[u8; 7] = b"3.45.1\0";
-pub const SQLITE_VERSION_NUMBER: i32 = 3045001;
+pub const SQLITE_VERSION: &[u8; 7] = b"3.47.0\0";
+pub const SQLITE_VERSION_NUMBER: i32 = 3047000;
 pub const SQLITE_SOURCE_ID: &[u8; 85] =
-    b"2024-01-30 16:01:20 e876e51a0ed5c5b3126f52e532044363a014bc594cfefa87ffb5b82257ccalt1\0";
+    b"2024-10-21 16:30:22 03a9703e27c44437c39363d0baf82db4ebc94538a0f28411c85dda156f82alt1\0";
 pub const LIBSQL_VERSION: &[u8; 6] = b"0.2.3\0";
 pub const SQLITE_OK: i32 = 0;
 pub const SQLITE_ERROR: i32 = 1;
@@ -264,6 +263,7 @@ pub const SQLITE_CONFIG_STMTJRNL_SPILL: i32 = 26;
 pub const SQLITE_CONFIG_SMALL_MALLOC: i32 = 27;
 pub const SQLITE_CONFIG_SORTERREF_SIZE: i32 = 28;
 pub const SQLITE_CONFIG_MEMDB_MAXSIZE: i32 = 29;
+pub const SQLITE_CONFIG_ROWID_IN_VIEW: i32 = 30;
 pub const SQLITE_DBCONFIG_MAINDBNAME: i32 = 1000;
 pub const SQLITE_DBCONFIG_LOOKASIDE: i32 = 1001;
 pub const SQLITE_DBCONFIG_ENABLE_FKEY: i32 = 1002;
@@ -357,12 +357,14 @@ pub const SQLITE_DIRECTONLY: i32 = 524288;
 pub const SQLITE_SUBTYPE: i32 = 1048576;
 pub const SQLITE_INNOCUOUS: i32 = 2097152;
 pub const SQLITE_RESULT_SUBTYPE: i32 = 16777216;
+pub const SQLITE_SELFORDER1: i32 = 33554432;
 pub const SQLITE_WIN32_DATA_DIRECTORY_TYPE: i32 = 1;
 pub const SQLITE_WIN32_TEMP_DIRECTORY_TYPE: i32 = 2;
 pub const SQLITE_TXN_NONE: i32 = 0;
 pub const SQLITE_TXN_READ: i32 = 1;
 pub const SQLITE_TXN_WRITE: i32 = 2;
 pub const SQLITE_INDEX_SCAN_UNIQUE: i32 = 1;
+pub const SQLITE_INDEX_SCAN_HEX: i32 = 2;
 pub const SQLITE_INDEX_CONSTRAINT_EQ: i32 = 2;
 pub const SQLITE_INDEX_CONSTRAINT_GT: i32 = 4;
 pub const SQLITE_INDEX_CONSTRAINT_LE: i32 = 8;
@@ -412,6 +414,7 @@ pub const SQLITE_TESTCTRL_RESERVE: i32 = 14;
 pub const SQLITE_TESTCTRL_JSON_SELFCHECK: i32 = 14;
 pub const SQLITE_TESTCTRL_OPTIMIZATIONS: i32 = 15;
 pub const SQLITE_TESTCTRL_ISKEYWORD: i32 = 16;
+pub const SQLITE_TESTCTRL_GETOPT: i32 = 16;
 pub const SQLITE_TESTCTRL_SCRATCHMALLOC: i32 = 17;
 pub const SQLITE_TESTCTRL_INTERNAL_FUNCTIONS: i32 = 17;
 pub const SQLITE_TESTCTRL_LOCALTIME_FAULT: i32 = 18;
@@ -502,8 +505,8 @@ pub const FTS5_TOKENIZE_DOCUMENT: i32 = 4;
 pub const FTS5_TOKENIZE_AUX: i32 = 8;
 pub const FTS5_TOKEN_COLOCATED: i32 = 1;
 pub const WAL_SAVEPOINT_NDATA: i32 = 4;
-pub type va_list = __builtin_va_list;
 pub type __gnuc_va_list = __builtin_va_list;
+pub type va_list = __builtin_va_list;
 extern "C" {
     pub static sqlite3_version: [::std::os::raw::c_char; 0usize];
 }
@@ -3188,11 +3191,74 @@ pub struct Fts5ExtensionApi {
             arg3: *mut ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int,
     >,
+    pub xColumnLocale: ::std::option::Option<
+        unsafe extern "C" fn(
+            arg1: *mut Fts5Context,
+            iCol: ::std::os::raw::c_int,
+            pz: *mut *const ::std::os::raw::c_char,
+            pn: *mut ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int,
+    >,
+    pub xTokenize_v2: ::std::option::Option<
+        unsafe extern "C" fn(
+            arg1: *mut Fts5Context,
+            pText: *const ::std::os::raw::c_char,
+            nText: ::std::os::raw::c_int,
+            pLocale: *const ::std::os::raw::c_char,
+            nLocale: ::std::os::raw::c_int,
+            pCtx: *mut ::std::os::raw::c_void,
+            xToken: ::std::option::Option<
+                unsafe extern "C" fn(
+                    arg1: *mut ::std::os::raw::c_void,
+                    arg2: ::std::os::raw::c_int,
+                    arg3: *const ::std::os::raw::c_char,
+                    arg4: ::std::os::raw::c_int,
+                    arg5: ::std::os::raw::c_int,
+                    arg6: ::std::os::raw::c_int,
+                ) -> ::std::os::raw::c_int,
+            >,
+        ) -> ::std::os::raw::c_int,
+    >,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct Fts5Tokenizer {
     _unused: [u8; 0],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct fts5_tokenizer_v2 {
+    pub iVersion: ::std::os::raw::c_int,
+    pub xCreate: ::std::option::Option<
+        unsafe extern "C" fn(
+            arg1: *mut ::std::os::raw::c_void,
+            azArg: *mut *const ::std::os::raw::c_char,
+            nArg: ::std::os::raw::c_int,
+            ppOut: *mut *mut Fts5Tokenizer,
+        ) -> ::std::os::raw::c_int,
+    >,
+    pub xDelete: ::std::option::Option<unsafe extern "C" fn(arg1: *mut Fts5Tokenizer)>,
+    pub xTokenize: ::std::option::Option<
+        unsafe extern "C" fn(
+            arg1: *mut Fts5Tokenizer,
+            pCtx: *mut ::std::os::raw::c_void,
+            flags: ::std::os::raw::c_int,
+            pText: *const ::std::os::raw::c_char,
+            nText: ::std::os::raw::c_int,
+            pLocale: *const ::std::os::raw::c_char,
+            nLocale: ::std::os::raw::c_int,
+            xToken: ::std::option::Option<
+                unsafe extern "C" fn(
+                    pCtx: *mut ::std::os::raw::c_void,
+                    tflags: ::std::os::raw::c_int,
+                    pToken: *const ::std::os::raw::c_char,
+                    nToken: ::std::os::raw::c_int,
+                    iStart: ::std::os::raw::c_int,
+                    iEnd: ::std::os::raw::c_int,
+                ) -> ::std::os::raw::c_int,
+            >,
+        ) -> ::std::os::raw::c_int,
+    >,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -3254,6 +3320,23 @@ pub struct fts5_api {
             pUserData: *mut ::std::os::raw::c_void,
             xFunction: fts5_extension_function,
             xDestroy: ::std::option::Option<unsafe extern "C" fn(arg1: *mut ::std::os::raw::c_void)>,
+        ) -> ::std::os::raw::c_int,
+    >,
+    pub xCreateTokenizer_v2: ::std::option::Option<
+        unsafe extern "C" fn(
+            pApi: *mut fts5_api,
+            zName: *const ::std::os::raw::c_char,
+            pUserData: *mut ::std::os::raw::c_void,
+            pTokenizer: *mut fts5_tokenizer_v2,
+            xDestroy: ::std::option::Option<unsafe extern "C" fn(arg1: *mut ::std::os::raw::c_void)>,
+        ) -> ::std::os::raw::c_int,
+    >,
+    pub xFindTokenizer_v2: ::std::option::Option<
+        unsafe extern "C" fn(
+            pApi: *mut fts5_api,
+            zName: *const ::std::os::raw::c_char,
+            ppUserData: *mut *mut ::std::os::raw::c_void,
+            ppTokenizer: *mut *mut fts5_tokenizer_v2,
         ) -> ::std::os::raw::c_int,
     >,
 }
@@ -3443,6 +3526,9 @@ pub struct libsql_wal_methods {
         ) -> ::std::os::raw::c_int,
     >,
     pub xDb: ::std::option::Option<unsafe extern "C" fn(pWal: *mut wal_impl, db: *mut sqlite3)>,
+    pub xSavepointForget: ::std::option::Option<
+        unsafe extern "C" fn(pWal: *mut wal_impl, aWalData: *mut ::std::os::raw::c_uint),
+    >,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -3541,6 +3627,7 @@ pub struct sqlite3_wal {
     pub nCkpt: ::std::os::raw::c_uint,
     pub lockError: ::std::os::raw::c_uchar,
     pub pSnapshot: *mut WalIndexHdr,
+    pub bGetSnapshot: ::std::os::raw::c_int,
     pub db: *mut sqlite3,
 }
 #[repr(C)]

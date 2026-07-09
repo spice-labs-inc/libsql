@@ -3,7 +3,7 @@
 ** Purpose:     Configuration of SQLite codecs
 ** Author:      Ulrich Telle
 ** Created:     2020-03-02
-** Copyright:   (c) 2006-2023 Ulrich Telle
+** Copyright:   (c) 2006-2024 Ulrich Telle
 ** License:     MIT
 */
 
@@ -188,6 +188,21 @@ sqlite3mc_cipher_name(int cipherIndex)
   return cipherName;
 }
 
+static
+int checkParameterValue(const char* paramName, int value)
+{
+  int ok = 1;
+  if (sqlite3_stricmp(paramName, "legacy_page_size") == 0 && value > 0)
+  {
+    ok = value >= 512 && value <= SQLITE_MAX_PAGE_SIZE && ((value - 1) & value) == 0;
+  }
+  if (ok && sqlite3_stricmp(paramName, "plaintext_header_size") == 0 && value > 0)
+  {
+    ok = value % 16 == 0;
+  }
+  return ok;
+}
+
 SQLITE_API int
 sqlite3mc_config_cipher(sqlite3* db, const char* cipherName, const char* paramName, int newValue)
 {
@@ -294,7 +309,8 @@ sqlite3mc_config_cipher(sqlite3* db, const char* cipherName, const char* paramNa
       value = (hasDefaultPrefix) ? param->m_default : (hasMinPrefix) ? param->m_minValue : (hasMaxPrefix) ? param->m_maxValue : param->m_value;
       if (!hasMinPrefix && !hasMaxPrefix)
       {
-        if (newValue >= 0 && newValue >= param->m_minValue && newValue <= param->m_maxValue)
+        if (newValue >= 0 && newValue >= param->m_minValue && newValue <= param->m_maxValue &&
+            checkParameterValue(paramName, newValue))
         {
           if (hasDefaultPrefix)
           {
@@ -772,11 +788,11 @@ sqlite3mcConfigureFromUri(sqlite3* db, const char *zDbName, int configDefault)
           if (value >= 0)
           {
             /* Configure cipher parameter if it was given in the URI */
-            char* param = (configDefault) ? sqlite3_mprintf("default:%s", cipherParams[j].m_name) : cipherParams[j].m_name;
+            const char* param = (configDefault) ? sqlite3_mprintf("default:%s", cipherParams[j].m_name) : cipherParams[j].m_name;
             sqlite3mc_config_cipher(db, cipherName, param, value);
             if (configDefault)
             {
-              sqlite3_free(param);
+              sqlite3_free((char*) param);
             }
           }
         }

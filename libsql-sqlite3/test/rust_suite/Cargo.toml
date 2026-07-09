@@ -4,7 +4,13 @@ version = "0.2.0"
 rust-version = "1.85"
 edition = "2021"
 
+# This crate is its own workspace root with no committed Cargo.lock, so CI
+# resolves it from scratch every run. resolver = "3" makes that resolution
+# MSRV-aware (it honors the 1.85.0 toolchain in rust-toolchain.toml) so it does
+# not pull in deps that require a newer compiler (e.g. icu_*/idna_adapter @ 1.86,
+# wasip2/wit-bindgen @ 1.87).
 [workspace]
+resolver = "3"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

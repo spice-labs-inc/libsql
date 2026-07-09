@@ -288,6 +288,17 @@ impl Wal for Sqlite3Wal {
         }
     }
 
+    fn savepoint_forget(&mut self, rollback_data: &mut [u32]) {
+        assert_eq!(rollback_data.len(), WAL_SAVEPOINT_NDATA as usize);
+        if self.inner.methods.iVersion >= 2 {
+            if let Some(savepoint_forget) = self.inner.methods.xSavepointForget {
+                unsafe {
+                    savepoint_forget(self.inner.pData, rollback_data.as_mut_ptr());
+                }
+            }
+        }
+    }
+
     fn frame_count(&self, locked: i32) -> Result<u32> {
         let mut out: u32 = 0;
         let rc = unsafe {

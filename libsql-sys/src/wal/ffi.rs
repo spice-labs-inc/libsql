@@ -17,7 +17,7 @@ use super::{PageHeaders, Sqlite3Db, Sqlite3File, Vfs, Wal, WalManager};
 pub(crate) fn construct_libsql_wal<W: Wal>(wal: *mut W) -> libsql_wal {
     libsql_wal {
         methods: libsql_wal_methods {
-            iVersion: 1,
+            iVersion: 2,
             xLimit: Some(limit::<W>),
             xBeginReadTransaction: Some(begin_read_transaction::<W>),
             xEndReadTransaction: Some(end_read_transaction::<W>),
@@ -45,6 +45,7 @@ pub(crate) fn construct_libsql_wal<W: Wal>(wal: *mut W) -> libsql_wal {
             xFile: None, // TODO: not all wal are single file based
             xWriteLock: None,
             xDb: Some(db::<W>),
+            xSavepointForget: Some(savepoint_forget::<W>),
         },
         pData: wal as *mut _,
     }
@@ -293,6 +294,12 @@ pub unsafe extern "C" fn savepoint_undo<T: Wal>(wal: *mut wal_impl, wal_data: *m
         Ok(_) => SQLITE_OK,
         Err(code) => code.extended_code,
     }
+}
+
+pub unsafe extern "C" fn savepoint_forget<T: Wal>(wal: *mut wal_impl, wal_data: *mut u32) {
+    let this = &mut (*(wal as *mut T));
+    let data = std::slice::from_raw_parts_mut(wal_data, WAL_SAVEPOINT_NDATA as usize);
+    this.savepoint_forget(data);
 }
 
 pub unsafe extern "C" fn frame_count<T: Wal>(

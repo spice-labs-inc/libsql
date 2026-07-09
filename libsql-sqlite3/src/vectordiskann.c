@@ -923,6 +923,38 @@ int distanceBufferInsertIdx(const float *aDistances, int nSize, int nMaxSize, fl
   return nSize < nMaxSize ? nSize : -1;
 }
 
+/*
+** Like distanceBufferInsertIdx() above, but for the buffer of top candidates,
+** where each slot also has an associated node (and therefore a rowid).
+**
+** When two candidates are exactly the same distance from the query vector the
+** plain distance comparison leaves their relative order up to the search/visit
+** order. That order depends on float-rounding of the distance computation,
+** which in turn varies with compiler/build flags, so equidistant results would
+** come back in a different order from one build to another. Breaking such ties
+** by rowid (ascending) makes the ordering of equidistant results deterministic
+** and reproducible regardless of how the search happened to reach them.
+*/
+static int topCandidateInsertIdx(
+  const float *aDistances,
+  DiskAnnNode *const *aCandidates,
+  int nSize,
+  int nMaxSize,
+  float distance,
+  u64 nRowid
+){
+  int i;
+  for(i = 0; i < nSize; i++){
+    if( distance < aDistances[i] ){
+      return i;
+    }
+    if( distance == aDistances[i] && nRowid < aCandidates[i]->nRowid ){
+      return i;
+    }
+  }
+  return nSize < nMaxSize ? nSize : -1;
+}
+
 void bufferInsert(u8 *aBuffer, int nSize, int nMaxSize, int iInsert, int nItemSize, const u8 *pItem, u8 *pLast) {
   int itemsToMove;
 
@@ -1100,7 +1132,7 @@ static void diskAnnSearchCtxMarkVisited(DiskAnnSearchCtx *pCtx, DiskAnnNode *pNo
   pNode->pNext = pCtx->visitedList;
   pCtx->visitedList = pNode;
 
-  iInsert = distanceBufferInsertIdx(pCtx->aTopDistances, pCtx->nTopCandidates, pCtx->maxTopCandidates, distance);
+  iInsert = topCandidateInsertIdx(pCtx->aTopDistances, pCtx->aTopCandidates, pCtx->nTopCandidates, pCtx->maxTopCandidates, distance, pNode->nRowid);
   if( iInsert < 0 ){
     return;
   }
