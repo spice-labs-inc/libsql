@@ -349,22 +349,15 @@ impl Replicator {
     }
 
     pub async fn with_options<S: Into<String>>(db_path: S, options: Options) -> Result<Self> {
-        let config = options.client_config().await?;
-        let client = Client::from_conf(config);
-        let bucket = options.bucket_name.clone();
-        let generation = Arc::new(ArcSwapOption::default());
-
-        // A small dedicated multi-threaded runtime for the replicator's heavy,
-        // bursty background work (snapshot zstd-compression and S3 upload).
-        // Running those on the main runtime — the one serving `/health` and
-        // Hrana — let a slow or large snapshot starve the request path on a
-        // 1-CPU cgroup (the incident root cause). This runtime's worker
-        // threads run spawned tasks in the background, so the request path is
-        // never blocked on them.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()?;
+        let runtime_handle = runtime.handle().clone();
+        let config = options.client_config().await?;
+        let client = Client::from_conf(config);
+        let bucket = options.bucket_name.clone();
+        let generation = Arc::new(ArcSwapOption::default());
 
         match client.head_bucket().bucket(&bucket).send().await {
             Ok(_) => tracing::info!("Bucket {} exists and is accessible", bucket),
@@ -421,45 +414,57 @@ impl Replicator {
             let last_sent_frame_no = last_sent_frame_no.clone();
             let batch_interval = options.max_batch_interval;
             let db_name = db_name.clone();
-            join_set.spawn(async move {
-                loop {
-                    let timeout = Instant::now() + batch_interval;
-                    let trigger = match timeout_at(timeout, flush_trigger_rx.changed()).await {
-                        Ok(Ok(())) => true,
-                        Ok(Err(_)) => {
-                            return;
-                        }
-                        Err(_) => {
-                            true // timeout reached
-                        }
-                    };
-                    if trigger {
-                        let next_frame = next_frame_no.load(Ordering::Acquire);
-                        let last_sent_frame =
-                            last_sent_frame_no.swap(next_frame - 1, Ordering::Acquire);
-                        let frames = (last_sent_frame + 1)..next_frame;
-
-                        if !frames.is_empty() {
-                            let start_time = Instant::now();
-                            let res = copier.flush(frames).await;
-                            Self::record_local_flush_time(&db_name, start_time.elapsed());
-
-                            if let Ok((last_frame_no, ready_ranges)) = res {
-                                Self::set_local_last_frame_no(&db_name, last_frame_no);
-                                Self::increment_local_ready_frame_ranges(&db_name, ready_ranges);
-                            }
-                            if last_committed_frame_no_sender
-                                .send(res.map(|r| r.0))
-                                .is_err()
-                            {
-                                // Replicator was probably dropped and therefore corresponding
-                                // receiver has been closed
+            // Spawn the continuous frame-flush loop on the dedicated replicator
+            // runtime (not the one serving `/health`/Hrana). It writes WAL
+            // frames to local files and flushes them to S3, which under
+            // sustained write load contends with the request path if it runs on
+            // the main runtime. It stays tracked in `join_set` so shutdown
+            // drains it as before.
+            join_set.spawn_on(
+                async move {
+                    loop {
+                        let timeout = Instant::now() + batch_interval;
+                        let trigger = match timeout_at(timeout, flush_trigger_rx.changed()).await {
+                            Ok(Ok(())) => true,
+                            Ok(Err(_)) => {
                                 return;
+                            }
+                            Err(_) => {
+                                true // timeout reached
+                            }
+                        };
+                        if trigger {
+                            let next_frame = next_frame_no.load(Ordering::Acquire);
+                            let last_sent_frame =
+                                last_sent_frame_no.swap(next_frame - 1, Ordering::Acquire);
+                            let frames = (last_sent_frame + 1)..next_frame;
+
+                            if !frames.is_empty() {
+                                let start_time = Instant::now();
+                                let res = copier.flush(frames).await;
+                                Self::record_local_flush_time(&db_name, start_time.elapsed());
+
+                                if let Ok((last_frame_no, ready_ranges)) = res {
+                                    Self::set_local_last_frame_no(&db_name, last_frame_no);
+                                    Self::increment_local_ready_frame_ranges(
+                                        &db_name,
+                                        ready_ranges,
+                                    );
+                                }
+                                if last_committed_frame_no_sender
+                                    .send(res.map(|r| r.0))
+                                    .is_err()
+                                {
+                                    // Replicator was probably dropped and therefore corresponding
+                                    // receiver has been closed
+                                    return;
+                                }
                             }
                         }
                     }
-                }
-            })
+                },
+                &runtime_handle,
+            )
         };
 
         let (upload_progress, last_uploaded_frame_no) = CompletionProgress::new(0);
@@ -471,7 +476,11 @@ impl Replicator {
             let upload_progress = upload_progress.clone();
             let db_name = db_name.clone();
             let shutdown_watch = Arc::new(shutdown_watch);
-            join_set.spawn(async move {
+            // Spawn the continuous S3 frame-upload loop on the dedicated
+            // replicator runtime, keeping it off the request-serving runtime.
+            // Like the flush loop it stays tracked in `join_set` for shutdown.
+            join_set.spawn_on(
+                async move {
                 let sem = Arc::new(tokio::sync::Semaphore::new(max_parallelism));
                 let mut join_set = JoinSet::new();
                 while let Some(req) = frames_inbox.recv().await {
@@ -526,7 +535,9 @@ impl Replicator {
                 }
 
                 while join_set.join_next().await.is_some() {}
-            })
+                },
+                &runtime_handle,
+            )
         };
         let (snapshot_notifier, snapshot_waiter) = channel(Ok(None));
         Ok(Self {
@@ -1001,15 +1012,31 @@ impl Replicator {
 
     // Returns the compressed database file path and its change counter, extracted
     // from the header of page1 at offset 24..27 (as per SQLite documentation).
-    pub async fn maybe_compress_main_db_file(
+    // Captures a quiesced copy of the database file into a staging file and
+    // returns its path. It runs *synchronously* inside the checkpoint's
+    // ConnectionManager quiescence window, so the bytes are guaranteed
+    // consistent (no writer can be mutating the file). The returned staging
+    // file is later uploaded to S3 asynchronously.
+    //
+    // For gzip/zstd this also compresses the copy; for no compression it is a
+    // plain copy of the DB file.
+    pub async fn stage_snapshot_file(
         db_path: &Path,
         compression: CompressionKind,
-    ) -> Result<ByteStream> {
+    ) -> Result<PathBuf> {
         if !tokio::fs::try_exists(db_path).await? {
             bail!("database file was not found at `{}`", db_path.display())
         }
         match compression {
-            CompressionKind::None => Ok(ByteStream::from_path(db_path).await?),
+            CompressionKind::None => {
+                let stage = Self::snapshot_stage_path(db_path, compression);
+                // Copy the DB file to a staging path inside the quiescence
+                // window. Uploading from this copy (not the live file) is what
+                // keeps the snapshot consistent even though the S3 upload runs
+                // after the checkpoint releases the write lock.
+                tokio::fs::copy(db_path, &stage).await?;
+                Ok(stage)
+            }
             CompressionKind::Gzip => {
                 let mut reader = File::open(db_path).await?;
                 let gzip_path = Self::db_compressed_path(db_path, "gz");
@@ -1028,7 +1055,7 @@ impl Replicator {
                     size,
                     gzip_path.display()
                 );
-                Ok(ByteStream::from_path(gzip_path).await?)
+                Ok(gzip_path)
             }
             CompressionKind::Zstd => {
                 let mut reader = File::open(db_path).await?;
@@ -1048,7 +1075,7 @@ impl Replicator {
                     size,
                     zstd_path.display()
                 );
-                Ok(ByteStream::from_path(zstd_path).await?)
+                Ok(zstd_path)
             }
         }
     }
@@ -1057,6 +1084,26 @@ impl Replicator {
         let mut compressed_path: PathBuf = db_path.to_path_buf();
         compressed_path.pop();
         compressed_path.join(format!("db.{suffix}"))
+    }
+
+    /// The staging path used to hold a quiesced copy of the database file while
+    /// its snapshot is uploaded to S3 asynchronously.
+    ///
+    /// For gzip/zstd compression this is the compressed file produced inside the
+    /// checkpoint's quiescence window. For no compression it is a plain copy.
+    /// Uploading from a staging file (rather than re-opening the live DB file)
+    /// is what guarantees the snapshot bytes were captured while writers were
+    /// quiesced, even though the actual S3 upload runs after the window closes.
+    fn snapshot_stage_path(db_path: &Path, compression: CompressionKind) -> PathBuf {
+        match compression {
+            CompressionKind::None => {
+                let mut path = PathBuf::from(db_path);
+                path.pop();
+                path.join("db.snapshot")
+            }
+            CompressionKind::Gzip => Self::db_compressed_path(db_path, "gz"),
+            CompressionKind::Zstd => Self::db_compressed_path(db_path, "zstd"),
+        }
     }
 
     fn restore_db_path(&self) -> PathBuf {
@@ -1149,33 +1196,40 @@ impl Replicator {
         let db_name = self.db_name.clone();
         let bucket = self.bucket.clone();
         let client = self.client.clone();
-        // Drive the snapshot (zstd-compress + S3 upload) on the dedicated
-        // replicator runtime, not the one serving `/health`/Hrana. Compressing
-        // a large database and uploading it to S3 is CPU/I/O heavy; running it
-        // on the main runtime allowed a slow or large snapshot to starve the
-        // only request-serving worker on a 1-CPU cgroup (the incident root
-        // cause). The DB file read below still happens while the ConnectionManager
-        // quiescence window is held, so the snapshot stays consistent.
+
+        // Compress (read) the database file *synchronously*, inside the
+        // checkpoint's ConnectionManager quiescence window: this is the read of
+        // the DB file that must not race a concurrent writer. Blocking for it
+        // is fine — it is deliberately short and is the price of a consistent
+        // snapshot. Only the S3 *upload* of the already-compressed bytes is
+        // spawned onto the dedicated runtime below.
+        //
+        // (Previously compress + upload ran together in a task on the main
+        // runtime. That both starved `/health` on a 1-CPU cgroup and let the
+        // compressed-file read drift outside the quiescence window, risking a
+        // torn snapshot.)
+        let body_path = match Self::stage_snapshot_file(&db_path, compression).await {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to compress db file (generation `{}`, path: `{}`): {:?}",
+                    generation,
+                    db_path.display(),
+                    e
+                );
+                let _ = snapshot_notifier.send(Err(e));
+                return Ok(None);
+            }
+        };
+
+        // Upload the snapshot (already-compressed DB file + change counter) on
+        // the dedicated replicator runtime, fully off the request path. This
+        // is network-bound and retrying, so it must never block `/health`.
+        // Only the upload is async here; the DB-file read finished above, so
+        // the quiescence window can be released without risking a torn file.
         let handle = self.runtime.spawn(async move {
-            tracing::trace!("Start snapshotting generation {}", generation);
+            tracing::trace!("Start uploading snapshot generation {}", generation);
             let start = Instant::now();
-            let body_path = match Self::maybe_compress_main_db_file(&db_path, compression).await {
-                Ok(_) => match compression {
-                    CompressionKind::None => db_path.clone(),
-                    CompressionKind::Gzip => Self::db_compressed_path(&db_path, "gz"),
-                    CompressionKind::Zstd => Self::db_compressed_path(&db_path, "zstd"),
-                },
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to compress db file (generation `{}`, path: `{}`): {:?}",
-                        generation,
-                        db_path.display(),
-                        e
-                    );
-                    let _ = snapshot_notifier.send(Err(e));
-                    return;
-                }
-            };
             let snapshot_key = format!("{}-{}/db.{}", db_name, generation, compression);
             let mut result = client
                 .put_object()
@@ -1233,10 +1287,9 @@ impl Replicator {
             let elapsed = Instant::now() - start;
             tracing::info!("Snapshot upload finished (took {:?})", elapsed);
             Self::record_snapshot_upload_time(&db_name, elapsed);
-            // cleanup gzip/zstd database snapshot if exists
-            for suffix in &["gz", "zstd"] {
-                let _ = tokio::fs::remove_file(Self::db_compressed_path(&db_path, suffix)).await;
-            }
+            // Remove the staged snapshot file (the quiesced DB copy or its
+            // compressed form) now that it has been uploaded.
+            let _ = tokio::fs::remove_file(&body_path).await;
         });
         let elapsed = Instant::now() - start_ts;
         tracing::debug!("Scheduled DB snapshot {} (took {:?})", generation, elapsed);
