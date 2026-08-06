@@ -10,6 +10,7 @@ mod types;
 pub mod timing;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::extract::{FromRef, FromRequest, FromRequestParts, Path as AxumPath, State as AxumState};
@@ -36,17 +37,19 @@ use tower_http::compression::{DefaultPredicate, Predicate};
 use tower_http::{compression::CompressionLayer, cors};
 
 use crate::auth::{Auth, AuthError, Authenticated, Jwt, Permission, UserAuthContext};
+use crate::connection::program::{Program, Step};
 use crate::connection::{Connection, RequestContext};
 use crate::error::Error;
 use crate::http::user::db_factory::MakeConnectionExtractorPath;
 use crate::http::user::timing::timings_middleware;
 use crate::http::user::types::HttpQuery;
 use crate::metrics::LEGACY_HTTP_CALL;
-use crate::namespace::NamespaceStore;
+use crate::namespace::{NamespaceName, NamespaceStore};
 use crate::net::Accept;
+use crate::query::Params;
 use crate::query::{self, Query};
 use crate::query_analysis::{predict_final_state, Statement, TxnStatus};
-use crate::query_result_builder::QueryResultBuilder;
+use crate::query_result_builder::{QueryResultBuilder, StepResult, StepResultsBuilder};
 use crate::rpc::proxy::rpc::proxy_server::{Proxy, ProxyServer};
 use crate::schema::{MigrationDetails, MigrationSummary};
 use crate::utils::services::idle_shutdown::IdleShutdownKicker;
@@ -163,9 +166,75 @@ async fn show_console(
     }
 }
 
-async fn handle_health() -> Response<Body> {
-    // return empty OK
-    Response::new(Body::empty())
+/// How long we are willing to wait for the database to prove it is servable
+/// before declaring the instance unhealthy.
+///
+/// The default kubelet liveness probe timeout is 1s and the probe is usually
+/// run more frequently than the failure threshold, so the budget here must be
+/// comfortably inside the probe timeout: a healthy-but-busy database gets the
+/// full budget, a wedged one (e.g. a checkpoint or S3 path holding the write
+/// lock on the single async worker) times out and the probe returns 503.
+const HEALTH_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+
+async fn handle_health(AxumState(state): AxumState<AppState>) -> impl IntoResponse {
+    // The default namespace reports "is this whole process able to serve its
+    // *data* path" — not merely "is HTTP up".
+    match serve_default_namespace_health(&state).await {
+        true => (StatusCode::OK, "").into_response(),
+        false => (StatusCode::SERVICE_UNAVAILABLE, "database not servable").into_response(),
+    }
+}
+
+/// Runs a real, bounded read against the default namespace to prove the
+/// datapath is servable. Returns `true` when a query completed within the
+/// budget. The entire round-trip — resolving the namespace, opening the
+/// connection, and running the query — is bounded by [`HEALTH_QUERY_TIMEOUT`]
+/// so a wedge anywhere in the datapath (not just query execution) becomes a
+/// 503.
+async fn serve_default_namespace_health(state: &AppState) -> bool {
+    let namespace = NamespaceName::default();
+
+    tokio::time::timeout(HEALTH_QUERY_TIMEOUT, async {
+        // Mirror how a real request resolves the namespace so the check
+        // exercises the same connection path (including the read-txn upgrade
+        // path that contends on the connection-manager write lock during
+        // checkpoints).
+        let Ok(connection_maker) = state
+            .namespaces
+            .with(namespace.clone(), |ns| ns.db.connection_maker())
+            .await
+        else {
+            return false;
+        };
+        let Ok(connection) = connection_maker.create().await else {
+            return false;
+        };
+        let meta_store = state.namespaces.meta_store().clone();
+        let ctx = RequestContext::new(Authenticated::FullAccess, namespace, meta_store);
+
+        // A single, pure read that exercises the same datapath as a real
+        // request. `SELECT 1` is constant and must always parse.
+        let query = Query {
+            stmt: Statement::parse("SELECT 1")
+                .next()
+                .expect("constant health query must parse")
+                .expect("constant health query must parse"),
+            params: Params::empty(),
+            want_rows: false,
+        };
+        let program = Program::new(vec![Step { cond: None, query }]);
+
+        // `SELECT 1` is a pure read: servable iff the single step succeeded.
+        match connection
+            .execute_program(program, ctx, StepResultsBuilder::default(), None)
+            .await
+        {
+            Ok(builder) => matches!(builder.into_ret().as_slice(), [StepResult::Ok]),
+            Err(_) => false,
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 async fn handle_upgrade(
