@@ -225,7 +225,13 @@ jobs:
     - name: embedded replica encryption tests
       run: cargo xtask test-encryption
   windows:
-    runs-on: windows-latest
+    # Pin to windows-2022 (VS 2022 / 17.x) rather than windows-latest.
+    # windows-latest migrated to the Windows Server 2025 / Visual Studio 2026
+    # image in June 2026, whose newer VS version is unrecognized by the pinned
+    # `cmake`/`cc` build-dependencies (they only know up to VS 2022), causing
+    # libsql-ffi's multiple-ciphers cmake build to panic. Keeping the runner on
+    # VS 2022 avoids a dependency bump and has no immediate deprecation cycle.
+    runs-on: windows-2022
     name: Windows checks
     steps:
       - uses: hecrj/setup-rust-action@v2
