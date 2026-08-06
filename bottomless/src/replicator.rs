@@ -76,6 +76,17 @@ pub struct Replicator {
     last_uploaded_frame_no: Receiver<u32>,
     skip_snapshot: bool,
     skip_shutdown_upload: bool,
+    /// Dedicated runtime that drives all of this replicator's background work
+    /// (frame and S3 upload loops) and its snapshot compression/uploads.
+    ///
+    /// Everything the replicator touches is I/O- or CPU-heavy (zstd-compressing
+    /// the database and uploading to S3). Running it on the *main* runtime —
+    /// the one that serves `/health` and Hrana — lets a slow or large snapshot
+    /// starve the only request-serving worker (the incident root cause). This
+    /// runtime is what receives those tasks so they can never preempt the
+    /// request path, while the ConnectionManager quiescence window and the
+    /// frame-ordering awaits above are unchanged.
+    runtime: tokio::runtime::Runtime,
 }
 
 #[derive(Debug)]
@@ -343,6 +354,18 @@ impl Replicator {
         let bucket = options.bucket_name.clone();
         let generation = Arc::new(ArcSwapOption::default());
 
+        // A small dedicated multi-threaded runtime for the replicator's heavy,
+        // bursty background work (snapshot zstd-compression and S3 upload).
+        // Running those on the main runtime — the one serving `/health` and
+        // Hrana — let a slow or large snapshot starve the request path on a
+        // 1-CPU cgroup (the incident root cause). This runtime's worker
+        // threads run spawned tasks in the background, so the request path is
+        // never blocked on them.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+
         match client.head_bucket().bucket(&bucket).send().await {
             Ok(_) => tracing::info!("Bucket {} exists and is accessible", bucket),
             Err(SdkError::ServiceError(err)) if err.err().is_not_found() => {
@@ -530,6 +553,7 @@ impl Replicator {
             upload_progress,
             last_uploaded_frame_no,
             skip_shutdown_upload,
+            runtime,
         })
     }
 
@@ -827,7 +851,7 @@ impl Replicator {
                 .body(ByteStream::from(Bytes::copy_from_slice(
                     prev.into_bytes().as_slice(),
                 )));
-        tokio::spawn(async move {
+        let handle = self.runtime.spawn(async move {
             if let Err(e) = request.send().await {
                 tracing::error!(
                     "Failed to store dependency between generations {} -> {}: {}",
@@ -843,6 +867,10 @@ impl Replicator {
                 );
             }
         });
+        // The dependency store is a best-effort S3 write; keep it on the
+        // dedicated replicator runtime so it never contends with the request
+        // path.
+        drop(handle);
     }
 
     pub async fn get_dependency(&self, generation: &Uuid) -> Result<Option<Uuid>> {
@@ -1121,7 +1149,14 @@ impl Replicator {
         let db_name = self.db_name.clone();
         let bucket = self.bucket.clone();
         let client = self.client.clone();
-        let handle = tokio::spawn(async move {
+        // Drive the snapshot (zstd-compress + S3 upload) on the dedicated
+        // replicator runtime, not the one serving `/health`/Hrana. Compressing
+        // a large database and uploading it to S3 is CPU/I/O heavy; running it
+        // on the main runtime allowed a slow or large snapshot to starve the
+        // only request-serving worker on a 1-CPU cgroup (the incident root
+        // cause). The DB file read below still happens while the ConnectionManager
+        // quiescence window is held, so the snapshot stays consistent.
+        let handle = self.runtime.spawn(async move {
             tracing::trace!("Start snapshotting generation {}", generation);
             let start = Instant::now();
             let body_path = match Self::maybe_compress_main_db_file(&db_path, compression).await {
@@ -1912,7 +1947,7 @@ impl Replicator {
                     let bucket = self.bucket.clone();
                     let key = key.to_string();
                     let client = self.client.clone();
-                    tokio::spawn(async move {
+                    self.runtime.spawn(async move {
                         let body = ByteStream::from_path(&fpath).await.unwrap();
                         if let Err(e) = client
                             .put_object()
