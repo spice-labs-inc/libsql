@@ -92,7 +92,7 @@ async fn configure_server(
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn backup_restore() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -237,7 +237,7 @@ async fn backup_restore() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn rollback_restore() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -730,7 +730,7 @@ async fn s3_connect_timeout_fires() {
 /// bottomless restore starts but the S3 connection is interrupted (stalls).
 /// This simulates an S3 server that accepts the TCP connection but never
 /// sends a response, causing read_timeout to fire.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn restore_fails_quickly_when_s3_interrupted() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -845,7 +845,7 @@ async fn restore_fails_quickly_when_s3_interrupted() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn replication_resumes_after_s3_outage() {
     let _ = tracing_subscriber::fmt::try_init();
 

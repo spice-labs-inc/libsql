@@ -1307,13 +1307,22 @@ impl Replicator {
 
     // Returns the number of pages stored in the local WAL file, or 0, if there aren't any.
     async fn get_local_wal_page_count(&mut self) -> Result<u32> {
-        match WalFileReader::open(&format!("{}-wal", &self.db_path)).await? {
-            None => Ok(0),
-            Some(wal) => {
+        let wal_path = format!("{}-wal", &self.db_path);
+        match WalFileReader::open(&wal_path).await {
+            // A missing WAL is the normal case for a fresh or check-pointed
+            // database: there are simply no local pages awaiting upload.
+            Ok(None) => Ok(0),
+            Ok(Some(wal)) => {
                 let page_size = wal.page_size();
                 self.set_page_size(page_size as usize)?;
                 Ok(wal.frame_count().await)
             }
+            // A WAL that exists but cannot be read must fail loudly: treating
+            // unreadable local state as empty would let a restore overwrite
+            // acknowledged writes. A genuinely absent WAL is not that case.
+            Err(e) if e.root_cause().downcast_ref::<std::io::Error>()
+                .map_or(false, |io| io.kind() == std::io::ErrorKind::NotFound) => Ok(0),
+            Err(e) => Err(e),
         }
     }
 
