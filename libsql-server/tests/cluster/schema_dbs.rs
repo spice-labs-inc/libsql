@@ -9,6 +9,23 @@ use crate::common::net::TurmoilConnector;
 
 use super::make_cluster;
 
+/// Wait for the replica's user API to start accepting connections. The hosts in
+/// the simulation start up concurrently, so the first connection made directly
+/// to the replica can race against its listener binding. Bound the wait so a
+/// replica that never comes up fails the test instead of hanging forever.
+async fn wait_for_replica_ready(http: &Client) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if http.get("http://replica0:8080/").await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for replica0 to become ready");
+}
+
 #[test]
 fn schema_migration_basics() {
     let mut sim = Builder::new()
@@ -37,6 +54,8 @@ fn schema_migration_basics() {
             .unwrap()
             .status()
             .is_success());
+
+        wait_for_replica_ready(&http).await;
 
         {
             let db = Database::open_remote_with_connector(
@@ -158,6 +177,8 @@ fn schema_migration_via_replica() {
             .unwrap()
             .status()
             .is_success());
+
+        wait_for_replica_ready(&http).await;
 
         {
             let db = Database::open_remote_with_connector(
