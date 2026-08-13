@@ -8,12 +8,10 @@ use libsql_client::{Connection, QueryResult, Statement, Value};
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
-use tokio::net::TcpListener;
 use tokio::time::sleep;
 use tokio::time::Duration;
 use url::Url;
@@ -25,36 +23,60 @@ use crate::config::{DbConfig, UserApiConfig};
 use crate::net::AddrIncoming;
 use crate::Server;
 
-/// A process-local registry assigning each named resource a unique, stable port.
-/// Binding an ephemeral port (port 0) lets the OS pick a currently-free one, so
-/// we never hardcode a well-known port that another test or an unrelated
-/// process on the host might already be bound to. Each `key` is cached, so a
-/// test can reuse the same port across restarts (e.g. the S3 outage test)
-/// without another test in this process grabbing it.
-static PORTS: OnceLock<Mutex<HashMap<String, u16>>> = OnceLock::new();
+/// A process-local registry assigning each named resource a unique, stable
+/// listener. The registry binds an OS-assigned ephemeral port (`:0`) and keeps
+/// the resulting `std::net::TcpListener` alive for the whole process, so the
+/// port stays bound for the test's lifetime. Rebinding by reusing a port number
+/// is a race (another process can grab the port in between), so instead every
+/// bind hands out a `try_clone` of the single held socket — the port is never
+/// released, only shared.
+///
+/// Each `key` is cached, so a test can reuse the same listener across restarts
+/// (e.g. the S3 outage test restarts its S3 server on the same port) without
+/// another test in this process grabbing it.
+static LISTENERS: OnceLock<Mutex<HashMap<String, std::net::TcpListener>>> = OnceLock::new();
 
-/// Unique, stable port for the given resource key. The first call per key learns
-/// a free port from the OS; later calls return the cached value.
-fn test_port(key: &str) -> u16 {
-    let mut ports = PORTS
+/// Bind an ephemeral port for a `key` and return the tokio listener + port,
+/// where the listener is a clone of the registry's held socket.
+fn test_listener(key: &str) -> (tokio::net::TcpListener, u16) {
+    let mut listeners = LISTENERS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap();
-    *ports.entry(key.to_string()).or_insert_with(|| {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    })
+    let entry = listeners
+        .entry(key.to_string())
+        .or_insert_with(|| std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+    let port = entry.local_addr().unwrap().port();
+    let shared = entry
+        .try_clone()
+        .expect("failed to clone bound test listener");
+    shared.set_nonblocking(true).unwrap();
+    let tokio_listener =
+        tokio::net::TcpListener::from_std(shared).expect("failed to convert test listener");
+    (tokio_listener, port)
 }
 
-/// Allocate a fresh, distinct S3 server port each call.
+/// Allocate a per-`key` listener and start a mock S3 server sharing that socket.
+/// Returns the graceful-shutdown handle plus the bound port. The listener given
+/// to the server is a clone of the registry's socket, so the port stays bound
+/// for the whole test.
 fn start_s3_server(key: &str) -> (S3ServerHandle, u16) {
-    let port = test_port(&format!("s3-{key}"));
+    let (listener, port) = test_listener(&format!("s3-{key}"));
     let tmp = std::env::temp_dir().join(format!("s3s-{}", Uuid::now_v7().as_simple()));
-    let handle = start_stoppable_s3_server(&format!("s3-{key}"), tmp);
+    let handle = start_stoppable_s3_server(listener, tmp);
     (handle, port)
+}
+
+/// Build a sqld `Server` listening on a fresh clone of the `db-<key>` socket.
+/// Each call clones the still-bound socket, so a multi-step test reuses one port
+/// without ever releasing it or rebinding it by number.
+async fn make_db_server(
+    key: &str,
+    options: &bottomless::replicator::Options,
+    path: impl Into<PathBuf>,
+) -> Server {
+    let (listener, _port) = test_listener(&format!("db-{key}"));
+    configure_server(options, listener, path).await
 }
 
 /// returns a future that once polled will shutdown the server and wait for cleanup
@@ -74,10 +96,10 @@ fn start_db(step: u32, server: Server) -> impl Future<Output = ()> {
 
 async fn configure_server(
     options: &bottomless::replicator::Options,
-    addr: SocketAddr,
+    listener: tokio::net::TcpListener,
     path: impl Into<PathBuf>,
 ) -> Server {
-    let http_acceptor = AddrIncoming::new(tokio::net::TcpListener::bind(addr).await.unwrap());
+    let http_acceptor = AddrIncoming::new(listener);
     Server {
         db_config: DbConfig {
             extensions_path: None,
@@ -128,7 +150,7 @@ async fn backup_restore() {
     const DB_ID: &str = "testbackuprestore";
     const BUCKET: &str = "testbackuprestore";
     const PATH: &str = "backup_restore.sqld";
-    let port = test_port("backup_restore-db");
+    let (_, port) = test_listener("db-backup_restore");
     const OPS: usize = 2000;
     const ROWS: usize = 10;
 
@@ -158,9 +180,8 @@ async fn backup_restore() {
         skip_shutdown_upload: false,
     };
     let connection_addr = Url::parse(&format!("http://localhost:{}", port)).unwrap();
-    let listener_addr = SocketAddr::from(([0, 0, 0, 0], port));
 
-    let make_server = || async { configure_server(&options, listener_addr, PATH).await };
+    let make_server = || make_db_server("backup_restore", &options, PATH);
 
     {
         tracing::info!(
@@ -269,7 +290,7 @@ async fn rollback_restore() {
     const DB_ID: &str = "testrollbackrestore";
     const BUCKET: &str = "testrollbackrestore";
     const PATH: &str = "rollback_restore.sqld";
-    let port = test_port("rollback_restore-db");
+    let (_, port) = test_listener("db-rollback_restore");
 
     async fn get_data(conn: &Url) -> Result<Vec<(Value, Value)>> {
         let result = sql(conn, ["SELECT * FROM t"]).await?;
@@ -289,7 +310,6 @@ async fn rollback_restore() {
     let _ = S3BucketCleaner::new(&s3_endpoint, BUCKET).await;
     assert_bucket_occupancy(&s3_endpoint, BUCKET, true).await;
 
-    let listener_addr = SocketAddr::from(([0, 0, 0, 0], port));
     let conn = Url::parse(&format!("http://localhost:{}", port)).unwrap();
     let options = bottomless::replicator::Options {
         db_id: Some(DB_ID.to_string()),
@@ -312,7 +332,7 @@ async fn rollback_restore() {
         skip_snapshot: false,
         skip_shutdown_upload: false,
     };
-    let make_server = || async { configure_server(&options, listener_addr, PATH).await };
+    let make_server = || make_db_server("rollback_restore", &options, PATH);
 
     {
         tracing::info!("---STEP 1: create db, write row, rollback---");
@@ -606,11 +626,11 @@ impl S3ServerHandle {
     }
 }
 
-/// Start a mock S3 server on a dedicated thread that can be gracefully shut
-/// down. The `dir` path is reused across restarts so S3 state persists, and it
-/// binds a per-`key` port so a test can restart it on the same port (the outage
-/// test relies on that) without racing other tests.
-fn start_stoppable_s3_server(key: &str, dir: PathBuf) -> S3ServerHandle {
+/// Start a mock S3 server on a dedicated thread, serving a clone of the
+/// registered listener so the port stays bound for the test's lifetime. The
+/// `dir` path is reused across restarts so S3 state persists; restarting on the
+/// same key serves a new clone of the same still-bound socket.
+fn start_stoppable_s3_server(listener: tokio::net::TcpListener, dir: PathBuf) -> S3ServerHandle {
     std::fs::create_dir_all(&dir).unwrap();
 
     let s3_impl = s3s_fs::FileSystem::new(dir).unwrap();
@@ -621,13 +641,14 @@ fn start_stoppable_s3_server(key: &str, dir: PathBuf) -> S3ServerHandle {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-    let port = test_port(key);
     std::thread::spawn(move || {
+        let listener = listener
+            .into_std()
+            .expect("failed to convert test listener");
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
-            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let addr = SocketAddr::from(([127, 0, 0, 1], port));
             let server = hyper::Server::from_tcp(listener).unwrap().serve(s3);
             let graceful = server.with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
@@ -642,12 +663,10 @@ fn start_stoppable_s3_server(key: &str, dir: PathBuf) -> S3ServerHandle {
     S3ServerHandle { shutdown_tx }
 }
 
-/// Start a TCP server that accepts connections but never sends a response.
-/// Used to test read_timeout behavior.
-async fn start_stall_server(port: u16) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+/// Start a TCP server on a per-`key` port that accepts connections but never
+/// sends a response, returning the bound port. Used to test read_timeout behavior.
+async fn start_stall_server(key: &str) -> u16 {
+    let (listener, port) = test_listener(&format!("stall-{key}"));
     tokio::spawn(async move {
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -663,6 +682,7 @@ async fn start_stall_server(port: u16) {
     });
     // Give the server a moment to start listening
     tokio::time::sleep(Duration::from_millis(100)).await;
+    port
 }
 
 #[tokio::test]
@@ -670,8 +690,7 @@ async fn s3_read_timeout_fires() {
     let _ = tracing_subscriber::fmt::try_init();
 
     // Start a stall server on a different port
-    let stall_port = test_port("s3_read_timeout-stall");
-    start_stall_server(stall_port).await;
+    let stall_port = start_stall_server("s3_read_timeout").await;
 
     let options = bottomless::replicator::Options {
         db_id: None,
@@ -767,7 +786,7 @@ async fn restore_fails_quickly_when_s3_interrupted() {
     // Step 1: Start the mock S3 server; keep it alive through step 1, then drop
     // it so the stall server can take over the S3 endpoint.
     let (_s3, s3_port) = start_s3_server("restore_fails_quickly");
-    let port = test_port("restore_fails_quickly-db");
+    let (_, port) = test_listener("db-restore_fails_quickly");
 
     // Build options without from_env() to avoid cross-test env var pollution.
     let options = bottomless::replicator::Options {
@@ -792,11 +811,13 @@ async fn restore_fails_quickly_when_s3_interrupted() {
         skip_shutdown_upload: false,
     };
     let connection_addr = Url::parse(&format!("http://localhost:{}", port)).unwrap();
-    let listener_addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     {
         let cleaner = DbFileCleaner::new(PATH);
-        let db_job = start_db(1, configure_server(&options, listener_addr, PATH).await);
+        let db_job = start_db(
+            1,
+            make_db_server("restore_fails_quickly", &options, PATH).await,
+        );
 
         sleep(Duration::from_secs(2)).await;
 
@@ -821,8 +842,7 @@ async fn restore_fails_quickly_when_s3_interrupted() {
     // S3 connection that starts but is interrupted.
     assert!(!std::path::Path::new(PATH).exists());
 
-    let stall_port = test_port("restore_fails_quickly-stall");
-    start_stall_server(stall_port).await;
+    let stall_port = start_stall_server("restore_fails_quickly").await;
 
     let stall_options = bottomless::replicator::Options {
         db_id: Some(DB_ID.to_string()),
@@ -846,7 +866,7 @@ async fn restore_fails_quickly_when_s3_interrupted() {
         skip_shutdown_upload: false,
     };
 
-    let server = configure_server(&stall_options, listener_addr, PATH).await;
+    let server = make_db_server("restore_fails_quickly", &stall_options, PATH).await;
     let start = Instant::now();
     let result = tokio::time::timeout(Duration::from_secs(30), server.start()).await;
     let elapsed = start.elapsed();
@@ -874,9 +894,9 @@ async fn replication_resumes_after_s3_outage() {
     const DB_ID: &str = "testreplicationresumes";
     const BUCKET: &str = "testreplicationresumes";
     const PATH: &str = "replication_resumes.sqld";
-    let s3_key = "replication_resumes-s3";
-    let s3_port = test_port(s3_key);
-    let port = test_port("replication_resumes-db");
+    let s3_key = "replication_resumes";
+    let (_, s3_port) = test_listener(&format!("s3-{s3_key}"));
+    let (_, port) = test_listener("db-replication_resumes");
 
     let s3_dir = std::env::temp_dir().join(format!("s3s-{}", DB_ID));
 
@@ -886,7 +906,8 @@ async fn replication_resumes_after_s3_outage() {
     let _ = std::fs::remove_dir_all(&s3_dir);
 
     // Step 1: Start S3, create DB, write data, verify replication.
-    let s3 = start_stoppable_s3_server(s3_key, s3_dir.clone());
+    let (listener, _) = test_listener(&format!("s3-{s3_key}"));
+    let s3 = start_stoppable_s3_server(listener, s3_dir.clone());
 
     assert_bucket_occupancy_with_endpoint(BUCKET, &s3_endpoint, true).await;
 
@@ -913,12 +934,14 @@ async fn replication_resumes_after_s3_outage() {
     };
 
     let connection_addr = Url::parse(&format!("http://localhost:{}", port)).unwrap();
-    let listener_addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     // Step 1: Start S3, start server, write initial data.
     tracing::info!("---STEP 1: start db and write initial data---");
     let cleaner = DbFileCleaner::new(PATH);
-    let db_job = start_db(1, configure_server(&options, listener_addr, PATH).await);
+    let db_job = start_db(
+        1,
+        make_db_server("replication_resumes", &options, PATH).await,
+    );
 
     sleep(Duration::from_secs(5)).await;
 
@@ -966,7 +989,8 @@ async fn replication_resumes_after_s3_outage() {
 
     // Step 3: Restart S3, write more data to trigger WAL flush, verify catch-up.
     tracing::info!("---STEP 3: restart S3, verify replication resumes---");
-    let _s3 = start_stoppable_s3_server(s3_key, s3_dir);
+    let (listener, _) = test_listener(&format!("s3-{s3_key}"));
+    let _s3 = start_stoppable_s3_server(listener, s3_dir);
     sleep(Duration::from_secs(1)).await;
 
     match sql(&connection_addr, ["INSERT INTO t(id, name) VALUES(3, 'C')"]).await {
@@ -988,7 +1012,10 @@ async fn replication_resumes_after_s3_outage() {
     // Step 4: Restore from scratch and verify all three rows are present.
     tracing::info!("---STEP 4: restore from backup and verify all rows---");
     let cleaner = DbFileCleaner::new(PATH);
-    let db_job = start_db(4, configure_server(&options, listener_addr, PATH).await);
+    let db_job = start_db(
+        4,
+        make_db_server("replication_resumes", &options, PATH).await,
+    );
 
     sleep(Duration::from_secs(5)).await;
 
