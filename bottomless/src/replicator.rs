@@ -1306,17 +1306,14 @@ impl Replicator {
     }
 
     // Returns the number of pages stored in the local WAL file, or 0, if there aren't any.
-    async fn get_local_wal_page_count(&mut self) -> u32 {
-        match WalFileReader::open(&format!("{}-wal", &self.db_path)).await {
-            Ok(None) => 0,
-            Ok(Some(wal)) => {
+    async fn get_local_wal_page_count(&mut self) -> Result<u32> {
+        match WalFileReader::open(&format!("{}-wal", &self.db_path)).await? {
+            None => Ok(0),
+            Some(wal) => {
                 let page_size = wal.page_size();
-                if self.set_page_size(page_size as usize).is_err() {
-                    return 0;
-                }
-                wal.frame_count().await
+                self.set_page_size(page_size as usize)?;
+                Ok(wal.frame_count().await)
             }
-            Err(_) => 0,
         }
     }
 
@@ -1381,8 +1378,10 @@ impl Replicator {
             .await
         {
             Ok(result) => {
+                // Move any existing local state aside instead of overwriting or
+                // deleting it, so a wrong restore decision stays recoverable.
+                self.preserve_local_state_aside().await;
                 tokio::fs::rename(&restore_path, &self.db_path).await?;
-                let _ = self.remove_wal_files().await; // best effort, WAL files may not exists
 
                 let elapsed = Instant::now() - start_ts;
                 tracing::info!("Finished database restoration in {:?}", elapsed);
@@ -1496,18 +1495,29 @@ impl Replicator {
         last_consistent_frame: u32,
     ) -> Result<Option<RestoreAction>> {
         // Check if the database needs to be restored by inspecting the database
-        // change counter and the WAL size.
-        let local_counter = self.read_change_counter().unwrap_or([0u8; 4]);
+        // change counter and the WAL size. A read error must never be taken as
+        // an empty database: restoring over unreadable-but-present local state
+        // destroys acknowledged writes.
+        let local_counter = tokio::task::block_in_place(|| self.read_change_counter())?;
         if local_counter != [0u8; 4] && local_counter != [0, 0, 0, 1] {
             // if a non-empty database file exists always treat it as new and more up to date,
             // skipping the restoration process and calling for a new generation to be made
             return Ok(Some(RestoreAction::SnapshotMainDbFile));
         }
 
+        let wal_pages = self.get_local_wal_page_count().await?;
+        if wal_pages > 0 {
+            // A fresh-looking main file with committed WAL frames is local data
+            // (the change counter only moves on checkpoint), not an empty db.
+            tracing::info!(
+                "Local WAL holds {} committed pages; treating local state as authoritative",
+                wal_pages
+            );
+            return Ok(Some(RestoreAction::SnapshotMainDbFile));
+        }
+
         let remote_counter = self.get_remote_change_counter(&generation).await?;
         tracing::debug!("Counters: l={:?}, r={:?}", local_counter, remote_counter);
-
-        let wal_pages = self.get_local_wal_page_count().await;
         // We impersonate as a given generation, since we're comparing against local backup at that
         // generation. This is used later in [Self::new_generation] to create a dependency between
         // this generation and a new one.
@@ -1745,11 +1755,25 @@ impl Replicator {
         Ok(applied_wal_frame)
     }
 
-    async fn remove_wal_files(&self) -> Result<()> {
-        tracing::debug!("Overwriting any existing WAL file: {}-wal", &self.db_path);
-        tokio::fs::remove_file(&format!("{}-wal", &self.db_path)).await?;
-        tokio::fs::remove_file(&format!("{}-shm", &self.db_path)).await?;
-        Ok(())
+    /// Move the local database, WAL, and shm files to `.pre-restore` siblings
+    /// (replacing any previous set) before a restore overwrites them. Best
+    /// effort: a rename failure is logged, never fatal, and never leaves the
+    /// restore blocked.
+    async fn preserve_local_state_aside(&self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let src = format!("{}{}", &self.db_path, suffix);
+            if matches!(tokio::fs::try_exists(&src).await, Ok(true)) {
+                let dst = format!("{}.pre-restore{}", &self.db_path, suffix);
+                match tokio::fs::rename(&src, &dst).await {
+                    Ok(()) => {
+                        tracing::warn!("preserved local {} as {} before restore", src, dst)
+                    }
+                    Err(e) => {
+                        tracing::error!("could not preserve {} before restore: {}", src, e)
+                    }
+                }
+            }
+        }
     }
 
     pub async fn copy(&mut self, generation: Option<Uuid>, to_dir: String) -> Result<()> {

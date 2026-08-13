@@ -727,8 +727,26 @@ async fn build_server(
     })
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // A low cpu cgroup limit yields as few as one runtime worker, and a single
+    // blocking call then stalls every task, health responses included.
+    let worker_threads = std::env::var("SQLD_RUNTIME_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .max(4)
+        });
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let args = Cli::parse();
 
     if std::env::var("RUST_LOG").is_err() {
