@@ -7,8 +7,10 @@ use itertools::Itertools;
 use libsql_client::{Connection, QueryResult, Statement, Value};
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
@@ -23,12 +25,36 @@ use crate::config::{DbConfig, UserApiConfig};
 use crate::net::AddrIncoming;
 use crate::Server;
 
-const S3_URL: &str = "http://localhost:9000/";
+/// A process-local registry assigning each named resource a unique, stable port.
+/// Binding an ephemeral port (port 0) lets the OS pick a currently-free one, so
+/// we never hardcode a well-known port that another test or an unrelated
+/// process on the host might already be bound to. Each `key` is cached, so a
+/// test can reuse the same port across restarts (e.g. the S3 outage test)
+/// without another test in this process grabbing it.
+static PORTS: OnceLock<Mutex<HashMap<String, u16>>> = OnceLock::new();
 
-/// Start a mock S3 server on port 9000 that can be gracefully shut down.
-fn start_s3_server() -> S3ServerHandle {
+/// Unique, stable port for the given resource key. The first call per key learns
+/// a free port from the OS; later calls return the cached value.
+fn test_port(key: &str) -> u16 {
+    let mut ports = PORTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    *ports.entry(key.to_string()).or_insert_with(|| {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    })
+}
+
+/// Allocate a fresh, distinct S3 server port each call.
+fn start_s3_server(key: &str) -> (S3ServerHandle, u16) {
+    let port = test_port(&format!("s3-{key}"));
     let tmp = std::env::temp_dir().join(format!("s3s-{}", Uuid::now_v7().as_simple()));
-    start_stoppable_s3_server(9000, tmp)
+    let handle = start_stoppable_s3_server(&format!("s3-{key}"), tmp);
+    (handle, port)
 }
 
 /// returns a future that once polled will shutdown the server and wait for cleanup
@@ -97,17 +123,18 @@ async fn configure_server(
 async fn backup_restore() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let _s3 = start_s3_server();
+    let (_s3, s3_port) = start_s3_server("backup_restore");
 
     const DB_ID: &str = "testbackuprestore";
     const BUCKET: &str = "testbackuprestore";
     const PATH: &str = "backup_restore.sqld";
-    const PORT: u16 = 15001;
+    let port = test_port("backup_restore-db");
     const OPS: usize = 2000;
     const ROWS: usize = 10;
 
-    let _ = S3BucketCleaner::new(BUCKET).await;
-    assert_bucket_occupancy(BUCKET, true).await;
+    let s3_endpoint = format!("http://127.0.0.1:{s3_port}");
+    let _ = S3BucketCleaner::new(&s3_endpoint, BUCKET).await;
+    assert_bucket_occupancy_with_endpoint(BUCKET, &format!("{s3_endpoint}/"), true).await;
 
     let options = bottomless::replicator::Options {
         db_id: Some(DB_ID.to_string()),
@@ -115,7 +142,7 @@ async fn backup_restore() {
         verify_crc: true,
         use_compression: bottomless::replicator::CompressionKind::Gzip,
         encryption_config: None,
-        aws_endpoint: Some("http://localhost:9000".to_string()),
+        aws_endpoint: Some(s3_endpoint.clone()),
         access_key_id: Some("bar".to_string()),
         secret_access_key: Some("foo".to_string()),
         session_token: None,
@@ -130,12 +157,8 @@ async fn backup_restore() {
         skip_snapshot: false,
         skip_shutdown_upload: false,
     };
-    let connection_addr = Url::parse(&format!("http://localhost:{}", PORT)).unwrap();
-    let listener_addr = format!("0.0.0.0:{}", PORT)
-        .to_socket_addrs()
-        .unwrap()
-        .next()
-        .unwrap();
+    let connection_addr = Url::parse(&format!("http://localhost:{}", port)).unwrap();
+    let listener_addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     let make_server = || async { configure_server(&options, listener_addr, PATH).await };
 
@@ -167,7 +190,7 @@ async fn backup_restore() {
 
     // make sure that db file doesn't exist, and that the bucket contains backup
     assert!(!std::path::Path::new(PATH).exists());
-    assert_bucket_occupancy(BUCKET, false).await;
+    assert_bucket_occupancy(&s3_endpoint, BUCKET, false).await;
 
     {
         tracing::info!(
@@ -223,7 +246,7 @@ async fn backup_restore() {
 
         // manually remove snapshots from all generations, this will force restore across generations
         // from the very beginning
-        remove_snapshots(BUCKET).await;
+        remove_snapshots(&s3_endpoint, BUCKET).await;
 
         let cleaner = DbFileCleaner::new(PATH);
         let db_job = start_db(4, make_server().await);
@@ -241,12 +264,12 @@ async fn backup_restore() {
 async fn rollback_restore() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let _s3 = start_s3_server();
+    let (_s3, s3_port) = start_s3_server("rollback_restore");
 
     const DB_ID: &str = "testrollbackrestore";
     const BUCKET: &str = "testrollbackrestore";
     const PATH: &str = "rollback_restore.sqld";
-    const PORT: u16 = 15002;
+    let port = test_port("rollback_restore-db");
 
     async fn get_data(conn: &Url) -> Result<Vec<(Value, Value)>> {
         let result = sql(conn, ["SELECT * FROM t"]).await?;
@@ -262,22 +285,19 @@ async fn rollback_restore() {
         Ok(rows)
     }
 
-    let _ = S3BucketCleaner::new(BUCKET).await;
-    assert_bucket_occupancy(BUCKET, true).await;
+    let s3_endpoint = format!("http://127.0.0.1:{s3_port}");
+    let _ = S3BucketCleaner::new(&s3_endpoint, BUCKET).await;
+    assert_bucket_occupancy(&s3_endpoint, BUCKET, true).await;
 
-    let listener_addr = format!("0.0.0.0:{}", PORT)
-        .to_socket_addrs()
-        .unwrap()
-        .next()
-        .unwrap();
-    let conn = Url::parse(&format!("http://localhost:{}", PORT)).unwrap();
+    let listener_addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let conn = Url::parse(&format!("http://localhost:{}", port)).unwrap();
     let options = bottomless::replicator::Options {
         db_id: Some(DB_ID.to_string()),
         create_bucket_if_not_exists: true,
         verify_crc: true,
         use_compression: bottomless::replicator::CompressionKind::Gzip,
         encryption_config: None,
-        aws_endpoint: Some("http://localhost:9000".to_string()),
+        aws_endpoint: Some(s3_endpoint.clone()),
         access_key_id: Some("bar".to_string()),
         secret_access_key: Some("foo".to_string()),
         session_token: None,
@@ -325,7 +345,7 @@ async fn rollback_restore() {
 
         // wait for backup
         sleep(Duration::from_secs(2)).await;
-        assert_bucket_occupancy(BUCKET, false).await;
+        assert_bucket_occupancy(&s3_endpoint, BUCKET, false).await;
 
         let rs = get_data(&conn).await.unwrap();
         assert_eq!(
@@ -425,8 +445,8 @@ where
     db.batch(stmts).await
 }
 
-async fn s3_config() -> aws_sdk_s3::config::Config {
-    let loader = aws_config::from_env().endpoint_url(S3_URL);
+async fn s3_config(endpoint: &str) -> aws_sdk_s3::config::Config {
+    let loader = aws_config::from_env().endpoint_url(endpoint);
     aws_sdk_s3::config::Builder::from(&loader.load().await)
         .force_path_style(true)
         .region(Region::new("us-east-1".to_string()))
@@ -434,16 +454,16 @@ async fn s3_config() -> aws_sdk_s3::config::Config {
         .build()
 }
 
-async fn s3_client() -> Result<Client> {
-    let conf = s3_config().await;
+async fn s3_client(endpoint: &str) -> Result<Client> {
+    let conf = s3_config(endpoint).await;
     let client = Client::from_conf(conf);
     Ok(client)
 }
 
 /// Remove a snapshot objects from all generation. This may trigger bottomless to do rollup restore
 /// across all generations.
-async fn remove_snapshots(bucket: &str) {
-    let client = s3_client().await.unwrap();
+async fn remove_snapshots(endpoint: &str, bucket: &str) {
+    let client = s3_client(endpoint).await.unwrap();
     if let Ok(out) = client.list_objects().bucket(bucket).send().await {
         let keys = out
             .contents()
@@ -475,8 +495,8 @@ async fn remove_snapshots(bucket: &str) {
 
 /// Checks if the corresponding bucket is empty (has any elements) or not.
 /// If bucket was not found, it's equivalent of an empty one.
-async fn assert_bucket_occupancy(bucket: &str, expect_empty: bool) {
-    assert_bucket_occupancy_with_endpoint(bucket, S3_URL, expect_empty).await;
+async fn assert_bucket_occupancy(endpoint: &str, bucket: &str, expect_empty: bool) {
+    assert_bucket_occupancy_with_endpoint(bucket, endpoint, expect_empty).await;
 }
 
 async fn assert_bucket_occupancy_with_endpoint(bucket: &str, endpoint: &str, expect_empty: bool) {
@@ -535,14 +555,14 @@ impl Drop for DbFileCleaner {
 struct S3BucketCleaner(&'static str);
 
 impl S3BucketCleaner {
-    async fn new(bucket: &'static str) -> Self {
-        let _ = Self::cleanup(bucket).await; // cleanup the bucket before test
+    async fn new(endpoint: &str, bucket: &'static str) -> Self {
+        let _ = Self::cleanup(endpoint, bucket).await; // cleanup the bucket before test
         S3BucketCleaner(bucket)
     }
 
     /// Delete all objects from S3 bucket with provided name (doesn't delete bucket itself).
-    async fn cleanup(bucket: &str) -> Result<()> {
-        let client = s3_client().await?;
+    async fn cleanup(endpoint: &str, bucket: &str) -> Result<()> {
+        let client = s3_client(endpoint).await?;
         let objects = client.list_objects().bucket(bucket).send().await?;
         let mut delete_keys = Vec::new();
         for o in objects.contents() {
@@ -587,8 +607,10 @@ impl S3ServerHandle {
 }
 
 /// Start a mock S3 server on a dedicated thread that can be gracefully shut
-/// down. The `dir` path is reused across restarts so S3 state persists.
-fn start_stoppable_s3_server(port: u16, dir: PathBuf) -> S3ServerHandle {
+/// down. The `dir` path is reused across restarts so S3 state persists, and it
+/// binds a per-`key` port so a test can restart it on the same port (the outage
+/// test relies on that) without racing other tests.
+fn start_stoppable_s3_server(key: &str, dir: PathBuf) -> S3ServerHandle {
     std::fs::create_dir_all(&dir).unwrap();
 
     let s3_impl = s3s_fs::FileSystem::new(dir).unwrap();
@@ -599,14 +621,18 @@ fn start_stoppable_s3_server(port: u16, dir: PathBuf) -> S3ServerHandle {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
+    let port = test_port(key);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
-            let addr = ([127, 0, 0, 1], port).into();
-            let server = hyper::Server::bind(&addr).serve(s3);
+            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            let server = hyper::Server::from_tcp(listener).unwrap().serve(s3);
             let graceful = server.with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
             });
+            tracing::debug!(%addr, "mock s3 server listening");
             graceful.await.unwrap();
         });
     });
@@ -644,7 +670,8 @@ async fn s3_read_timeout_fires() {
     let _ = tracing_subscriber::fmt::try_init();
 
     // Start a stall server on a different port
-    start_stall_server(9001).await;
+    let stall_port = test_port("s3_read_timeout-stall");
+    start_stall_server(stall_port).await;
 
     let options = bottomless::replicator::Options {
         db_id: None,
@@ -652,7 +679,7 @@ async fn s3_read_timeout_fires() {
         verify_crc: true,
         use_compression: bottomless::replicator::CompressionKind::Gzip,
         encryption_config: None,
-        aws_endpoint: Some("http://127.0.0.1:9001".to_string()),
+        aws_endpoint: Some(format!("http://127.0.0.1:{stall_port}")),
         access_key_id: Some("test".to_string()),
         secret_access_key: Some("test".to_string()),
         session_token: None,
@@ -737,12 +764,10 @@ async fn restore_fails_quickly_when_s3_interrupted() {
     const DB_ID: &str = "testrestoretimeout";
     const BUCKET: &str = "testrestoretimeout";
     const PATH: &str = "restore_timeout.sqld";
-    const PORT: u16 = 15003;
-
-    // Step 1: Start the mock S3 server and create a database with bottomless replication.
-    // We set aws_endpoint explicitly so this test is immune to env vars left behind by
-    // other tests running in parallel.
-    let _s3 = start_s3_server();
+    // Step 1: Start the mock S3 server; keep it alive through step 1, then drop
+    // it so the stall server can take over the S3 endpoint.
+    let (_s3, s3_port) = start_s3_server("restore_fails_quickly");
+    let port = test_port("restore_fails_quickly-db");
 
     // Build options without from_env() to avoid cross-test env var pollution.
     let options = bottomless::replicator::Options {
@@ -751,7 +776,7 @@ async fn restore_fails_quickly_when_s3_interrupted() {
         verify_crc: true,
         use_compression: bottomless::replicator::CompressionKind::Gzip,
         encryption_config: None,
-        aws_endpoint: Some("http://localhost:9000".to_string()),
+        aws_endpoint: Some(format!("http://127.0.0.1:{s3_port}")),
         access_key_id: Some("bar".to_string()),
         secret_access_key: Some("foo".to_string()),
         session_token: None,
@@ -766,12 +791,8 @@ async fn restore_fails_quickly_when_s3_interrupted() {
         skip_snapshot: false,
         skip_shutdown_upload: false,
     };
-    let connection_addr = Url::parse(&format!("http://localhost:{}", PORT)).unwrap();
-    let listener_addr = format!("0.0.0.0:{}", PORT)
-        .to_socket_addrs()
-        .unwrap()
-        .next()
-        .unwrap();
+    let connection_addr = Url::parse(&format!("http://localhost:{}", port)).unwrap();
+    let listener_addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     {
         let cleaner = DbFileCleaner::new(PATH);
@@ -800,7 +821,8 @@ async fn restore_fails_quickly_when_s3_interrupted() {
     // S3 connection that starts but is interrupted.
     assert!(!std::path::Path::new(PATH).exists());
 
-    start_stall_server(9002).await;
+    let stall_port = test_port("restore_fails_quickly-stall");
+    start_stall_server(stall_port).await;
 
     let stall_options = bottomless::replicator::Options {
         db_id: Some(DB_ID.to_string()),
@@ -808,7 +830,7 @@ async fn restore_fails_quickly_when_s3_interrupted() {
         verify_crc: true,
         use_compression: bottomless::replicator::CompressionKind::Gzip,
         encryption_config: None,
-        aws_endpoint: Some("http://127.0.0.1:9002".to_string()),
+        aws_endpoint: Some(format!("http://127.0.0.1:{stall_port}")),
         access_key_id: Some("bar".to_string()),
         secret_access_key: Some("foo".to_string()),
         session_token: None,
@@ -852,18 +874,19 @@ async fn replication_resumes_after_s3_outage() {
     const DB_ID: &str = "testreplicationresumes";
     const BUCKET: &str = "testreplicationresumes";
     const PATH: &str = "replication_resumes.sqld";
-    const PORT: u16 = 15004;
-    const S3_PORT: u16 = 9003;
+    let s3_key = "replication_resumes-s3";
+    let s3_port = test_port(s3_key);
+    let port = test_port("replication_resumes-db");
 
     let s3_dir = std::env::temp_dir().join(format!("s3s-{}", DB_ID));
 
-    let s3_endpoint = format!("http://127.0.0.1:{}/", S3_PORT);
+    let s3_endpoint = format!("http://127.0.0.1:{s3_port}/");
 
     // Clean up any leftover data from previous test runs.
     let _ = std::fs::remove_dir_all(&s3_dir);
 
     // Step 1: Start S3, create DB, write data, verify replication.
-    let s3 = start_stoppable_s3_server(S3_PORT, s3_dir.clone());
+    let s3 = start_stoppable_s3_server(s3_key, s3_dir.clone());
 
     assert_bucket_occupancy_with_endpoint(BUCKET, &s3_endpoint, true).await;
 
@@ -873,7 +896,7 @@ async fn replication_resumes_after_s3_outage() {
         verify_crc: true,
         use_compression: bottomless::replicator::CompressionKind::Gzip,
         encryption_config: None,
-        aws_endpoint: Some(format!("http://127.0.0.1:{}", S3_PORT)),
+        aws_endpoint: Some(format!("http://127.0.0.1:{s3_port}")),
         access_key_id: Some("bar".to_string()),
         secret_access_key: Some("foo".to_string()),
         session_token: None,
@@ -889,12 +912,8 @@ async fn replication_resumes_after_s3_outage() {
         skip_shutdown_upload: true,
     };
 
-    let connection_addr = Url::parse(&format!("http://localhost:{}", PORT)).unwrap();
-    let listener_addr = format!("0.0.0.0:{}", PORT)
-        .to_socket_addrs()
-        .unwrap()
-        .next()
-        .unwrap();
+    let connection_addr = Url::parse(&format!("http://localhost:{}", port)).unwrap();
+    let listener_addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     // Step 1: Start S3, start server, write initial data.
     tracing::info!("---STEP 1: start db and write initial data---");
@@ -947,7 +966,7 @@ async fn replication_resumes_after_s3_outage() {
 
     // Step 3: Restart S3, write more data to trigger WAL flush, verify catch-up.
     tracing::info!("---STEP 3: restart S3, verify replication resumes---");
-    let _s3 = start_stoppable_s3_server(S3_PORT, s3_dir);
+    let _s3 = start_stoppable_s3_server(s3_key, s3_dir);
     sleep(Duration::from_secs(1)).await;
 
     match sql(&connection_addr, ["INSERT INTO t(id, name) VALUES(3, 'C')"]).await {

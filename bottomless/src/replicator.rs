@@ -1320,8 +1320,13 @@ impl Replicator {
             // A WAL that exists but cannot be read must fail loudly: treating
             // unreadable local state as empty would let a restore overwrite
             // acknowledged writes. A genuinely absent WAL is not that case.
-            Err(e) if e.root_cause().downcast_ref::<std::io::Error>()
-                .map_or(false, |io| io.kind() == std::io::ErrorKind::NotFound) => Ok(0),
+            Err(e)
+                if e.root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .map_or(false, |io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(0)
+            }
             Err(e) => Err(e),
         }
     }
